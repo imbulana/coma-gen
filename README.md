@@ -18,7 +18,10 @@ pip install -r requirements.txt
 Download the Maestro 3.0 dataset
 
 ```bash
-
+wget https://storage.googleapis.com/magentadata/datasets/maestro/v3.0.0/maestro-v3.0.0-midi.zip
+unzip 'maestro-v3.0.0-midi.zip'
+rm 'maestro-v3.0.0-midi.zip'
+mv 'maestro-v3.0.0' 'data/maestro-v3.0.0'
 ```
 
 ## Usage
