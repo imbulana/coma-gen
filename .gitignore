@@ -1,0 +1,13 @@
+__pycache__/
+.DS_Store
+%APPDATA%
+
+*.pt
+data/
+generated/
+logs/
+*.json
+
+TODO.md
+
+tests/
