@@ -23,7 +23,13 @@ Download the Maestro 3.0 dataset
 
 ## Usage
 
-Adjust training params in [`train.py`](/train.py) and begin a training with
+Train the tokenizer with
+
+```bash
+python3 train_tokenizer.py
+```
+
+Adjust training params in [`train.py`](/train.py) and begin training the transformer with
 
 ```bash
 python3 train.py
