@@ -1,0 +1,7 @@
+torch
+einops
+miditok
+
+tensorboard
+tqdm
+pandas
