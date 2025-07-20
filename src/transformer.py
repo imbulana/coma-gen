@@ -254,7 +254,7 @@ class LocalTransformer(Module):
         ff_mult = 4,
         attn_dropout = 0.,
         ff_dropout = 0.,
-        ignore_index = -1,
+        ignore_index = 0,
         use_xpos = False,
         xpos_scale_base = None,
         use_dynamic_pos_bias = False,
@@ -295,12 +295,36 @@ class LocalTransformer(Module):
         for index in range(depth):
             layer = index + 1
 
-            self.global_layers.append(init_hyper_conn(dim = dim, branch = deepcopy(global_attn_layer)) if exists(global_attn_layer) and layer in global_attn_layers else None)
+            self.global_layers.append(
+                init_hyper_conn(dim = dim, branch = deepcopy(global_attn_layer)) 
+                if exists(global_attn_layer) and layer in global_attn_layers 
+                else None
+            )
 
-            self.layers.append(nn.ModuleList([
-                init_hyper_conn(dim = dim, branch = LocalMHA(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout, causal = causal, window_size = local_attn_window_size, use_xpos = use_xpos, xpos_scale_base = xpos_scale_base, use_rotary_pos_emb = not use_dynamic_pos_bias, prenorm = True, **kwargs)),
-                init_hyper_conn(dim = dim, branch = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout))
-            ]))
+            self.layers.append(
+                nn.ModuleList([
+                    init_hyper_conn(
+                        dim = dim, 
+                        branch = LocalMHA(
+                            dim = dim, 
+                            dim_head = dim_head, 
+                            heads = heads, 
+                            dropout = attn_dropout, 
+                            causal = causal, 
+                            window_size = local_attn_window_size, 
+                            use_xpos = use_xpos, 
+                            xpos_scale_base = xpos_scale_base, 
+                            use_rotary_pos_emb = not use_dynamic_pos_bias, 
+                            prenorm = True, 
+                            **kwargs
+                        )
+                    ),
+                    init_hyper_conn(
+                        dim = dim, 
+                        branch = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
+                    )
+                ])
+            )
 
         self.ignore_index = ignore_index
 
@@ -364,6 +388,8 @@ class LocalTransformer(Module):
     ):
         if return_loss:
             x, labels = x[:, :-1], x[:, 1:]
+            if exists(mask):
+                mask = mask[:, :-1]
 
         n, device = x.shape[1], x.device
 

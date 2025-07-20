@@ -38,10 +38,10 @@ LOG_DIR.mkdir(exist_ok=True)
 
 NUM_BATCHES = int(1e4)
 BATCH_SIZE = 8
-GRADIENT_ACCUMULATE_EVERY = 8
+GRADIENT_ACCUMULATE_EVERY = 4
 LEARNING_RATE = 2e-4
-VALIDATE_EVERY  = 500
-GENERATE_EVERY  = 500
+VALIDATE_EVERY  = 150
+GENERATE_EVERY  = 50
 GENERATE_LENGTH = 512
 MAX_SEQ_LEN = 1024
 DEVICE = (
@@ -57,7 +57,10 @@ writer = SummaryWriter(log_dir=LOG_DIR)
 def cycle(loader):
     while True:
         for data in loader:
-            yield data['input_ids'].to(DEVICE)
+            yield (
+                data['input_ids'].to(DEVICE),
+                data['attention_mask'].bool().to(DEVICE)
+            )
 
 def decode_tokens(tokens, tokenizer):
     return tokenizer.decode([tokens])
@@ -175,7 +178,8 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     model.train()
 
     for __ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss = model(next(train_loader), return_loss = True)
+        inp, mask = next(train_loader)
+        loss = model(inp, mask=mask, return_loss=True)
         loss.backward()
 
     print(f'training loss: {loss.item():.4f}, perplexity: {torch.exp(loss).item():.4f}')
@@ -192,7 +196,8 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
-            loss = model(next(val_loader), return_loss = True)
+            inp, mask = next(val_loader)
+            loss = model(inp, mask=mask, return_loss=True)
             print(f'validation loss: {loss.item():.4f}, perplexity: {torch.exp(loss).item():.4f}')
             
             # Log validation metrics
