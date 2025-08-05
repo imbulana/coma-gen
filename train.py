@@ -7,6 +7,8 @@ import shutil
 import torch
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
+from torch.nn import functional as F
+from einops import rearrange
 
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
@@ -20,35 +22,9 @@ from miditok.pytorch_data import DatasetMIDI, DataCollator
 from miditok.utils import split_files_for_training
 from miditok.data_augmentation import augment_dataset
 
-# constants
+# load config
 
-MAESTRO_DATA_PATH = Path("data/maestro-v3.0.0").resolve()
-MAESTRO_CSV = MAESTRO_DATA_PATH / "maestro-v3.0.0.csv"
-
-# SPLIT_DATA = True if not os.path.exists(MAESTRO_DATA_PATH / "splits") else False
-SPLIT_DATA = False
-LABEL_COMPOSER = False # for classification task
-AUGMENT_DATA = False
-
-GEN_PATH = Path("generated").resolve()
-GEN_PATH.mkdir(exist_ok=True)
-
-LOG_DIR = Path("logs").resolve() / datetime.now().strftime("%Y%m%d_%H%M%S")
-LOG_DIR.mkdir(exist_ok=True)
-
-NUM_BATCHES = int(1e4)
-BATCH_SIZE = 8
-GRADIENT_ACCUMULATE_EVERY = 4
-LEARNING_RATE = 2e-4
-VALIDATE_EVERY  = 150
-GENERATE_EVERY  = 50
-GENERATE_LENGTH = 512
-MAX_SEQ_LEN = 1024
-DEVICE = (
-    'cuda' if torch.cuda.is_available() else
-    'mps' if torch.backends.mps.is_available() else
-    'cpu'
-)
+from config import *
 
 writer = SummaryWriter(log_dir=LOG_DIR)
 
@@ -63,11 +39,22 @@ def cycle(loader):
             )
 
 def decode_tokens(tokens, tokenizer):
-    return tokenizer.decode([tokens])
+    return tokenizer([tokens])
+
+def top_k(logits, thres = 0.9):
+    k = int((1 - thres) * logits.shape[-1])
+    val, ind = torch.topk(logits, k)
+    probs = torch.full_like(logits, float('-inf'))
+    probs.scatter_(1, ind, val)
+    return probs
+
+def extract_pitches_from_tokens(tokens, tokenizer):
+    pass
 
 # load tokenizer and maestro data
 
-tokenizer = REMI(params=Path("tokenizer.json"))
+config = TokenizerConfig(**TOKENIZER_PARAMS)
+tokenizer = REMI(config)
 
 if SPLIT_DATA:
     split_parent_path = MAESTRO_DATA_PATH / "splits"
@@ -81,34 +68,17 @@ if SPLIT_DATA:
 
         split_path.mkdir(parents=True, exist_ok=True)
 
-        if LABEL_COMPOSER:
-            for composer, df_composer in df_split.groupby("canonical_composer"):
-                composer_path = split_path / composer
-                os.makedirs(composer_path, exist_ok=True)
+        midi_file_paths = df_split["midi_filename"].apply(
+            lambda x: MAESTRO_DATA_PATH / x
+        ).tolist()
 
-                midi_file_paths = df_composer["midi_filename"].apply(
-                    lambda x: MAESTRO_DATA_PATH / x
-                ).tolist()
-
-                split_files_for_training(
-                    files_paths=midi_file_paths,
-                    tokenizer=tokenizer,
-                    save_dir=composer_path,
-                    max_seq_len=MAX_SEQ_LEN,
-                    num_overlap_bars=2,
-                )
-        else:
-            midi_file_paths = df_split["midi_filename"].apply(
-                lambda x: MAESTRO_DATA_PATH / x
-            ).tolist()
-
-            split_files_for_training(
-                files_paths=midi_file_paths,
-                tokenizer=tokenizer,
-                save_dir=split_path,
-                max_seq_len=MAX_SEQ_LEN,
-                num_overlap_bars=2,
-            )
+        split_files_for_training(
+            files_paths=midi_file_paths,
+            tokenizer=tokenizer,
+            save_dir=split_path,
+            max_seq_len=MAX_SEQ_LEN,
+            num_overlap_bars=2,
+        )
 
 
 midi_paths_train = list(MAESTRO_DATA_PATH.glob("splits/train/*/*.mid?"))
@@ -153,14 +123,15 @@ collator_left_pad = DataCollator(pad_token_id=tokenizer["PAD_None"], pad_on_left
 train_loader = cycle(DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collator_right_pad))
 val_loader = cycle(DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator_left_pad))
 
-# instantiate GPT-like decoder model
+# instantiate model
 
 model = LocalTransformer(
     num_tokens = len(tokenizer), # vocab size
-    dim = 512,
-    depth = 6,
+    dim = 144,
+    depth = 4,
     causal = True,
-    local_attn_window_size = 256,
+    local_attn_window_size = 64,
+    # local_attn_window_sizes = ATTN_WINDOW_SIZES,
     max_seq_len = MAX_SEQ_LEN,
     use_dynamic_pos_bias = True,
     ignore_index = tokenizer["PAD_None"]
@@ -170,68 +141,133 @@ print(f"\nmodel size: {sum(p.numel() for p in model.parameters()):,}")
 
 # optimizer
 
-optim = Adam(model.parameters(), lr=LEARNING_RATE)
+optim = Adam(model.parameters(), lr=LEARNING_RATE) # TODO: try AdamW
 
 # training
 
+constant_seed = random.choice(val_dataset)['input_ids'].to(DEVICE)
+constant_seed_midi = decode_tokens(constant_seed.tolist(), tokenizer)
+constant_seed_midi.dump_midi(GEN_PATH / f"0_const_seed.mid")
+
+best_val_loss = float('inf')
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     model.train()
+    
+    train_loss = 0.
+    # train_melody_consistency_total = 0.
 
-    for __ in range(GRADIENT_ACCUMULATE_EVERY):
+    for _ in range(GRADIENT_ACCUMULATE_EVERY):
         inp, mask = next(train_loader)
-        loss = model(inp, mask=mask, return_loss=True)
-        loss.backward()
 
-    print(f'training loss: {loss.item():.4f}, perplexity: {torch.exp(loss).item():.4f}')
+        inp, labels = inp[:, :-1], inp[:, 1:]
+        mask = mask[:, :-1]
+
+        logits = model(inp, mask=mask)
+
+        loss = F.cross_entropy(
+            rearrange(logits, 'b n c -> b c n'),
+            labels,
+            ignore_index = tokenizer["PAD_None"]
+        )
+
+        loss.backward()
+        train_loss += loss.item()
+
+        # filtered_logits = top_k(logits[:, -1], thres = FILTER_THRES)
+
+        # if TEMPERATURE == 0.:
+        #     sampled = filtered_logits.argmax(dim = -1, keepdim = True)
+        # else:
+        #     probs = F.softmax(filtered_logits / TEMPERATURE, dim = -1)
+        #     sampled = torch.multinomial(probs, 1)
+
+        # train_melody_consistency_total += calculate_melody_consistency_from_logits(logits, labels, tokenizer)
+    
+    train_loss /= GRADIENT_ACCUMULATE_EVERY
+    # train_melody_consistency = train_melody_consistency_total / GRADIENT_ACCUMULATE_EVERY
+
+    print(f'training loss: {train_loss:.4f}, perplexity: {torch.exp(torch.tensor(train_loss)).item():.4f}')
     
     # log to tensorboard
-    writer.add_scalar('Loss/Train', loss.item(), i)
-    writer.add_scalar('Perplexity/Train', torch.exp(loss).item(), i)
+    writer.add_scalar('Loss/Train', train_loss, i)
+    writer.add_scalar('Perplexity/Train', torch.exp(torch.tensor(train_loss)).item(), i)
     
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+    # writer.add_scalar('Melody_Consistency/Train', train_melody_consistency, i)
+    # print(f'training melody consistency: {train_melody_consistency:.4f}')
+    
+    # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
 
-    best_val_loss = float('inf')
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
             inp, mask = next(val_loader)
-            loss = model(inp, mask=mask, return_loss=True)
-            print(f'validation loss: {loss.item():.4f}, perplexity: {torch.exp(loss).item():.4f}')
+            inp, labels = inp[:, :-1], inp[:, 1:]
+            mask = mask[:, :-1]
+
+            logits = model(inp, mask=mask)
+            val_loss = F.cross_entropy(
+                rearrange(logits, 'b n c -> b c n'),
+                labels,
+                ignore_index = tokenizer["PAD_None"]
+            )
+            
+            # val_melody_consistency = calculate_batch_melody_consistency(inp, model, tokenizer)
+            # print(f'validation melody consistency: {val_melody_consistency:.4f}')
             
             # Log validation metrics
-            writer.add_scalar('Loss/Validation', loss.item(), i)
-            writer.add_scalar('Perplexity/Validation', torch.exp(loss).item(), i)
+            writer.add_scalar('Loss/Validation', val_loss.item(), i)
+            writer.add_scalar('Perplexity/Validation', torch.exp(val_loss).item(), i)
+            # writer.add_scalar('Melody_Consistency/Validation', val_melody_consistency, i)
             
             # Save model checkpoint
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optim.state_dict(),
                 'epoch': i,
-                'train_loss': loss.item(),
-                'val_loss': loss.item(),
-                'perplexity': torch.exp(loss).item()
+                'train_loss': train_loss,  # Correct training loss
+                'val_loss': val_loss.item(),  # Correct validation loss
+                'perplexity': torch.exp(val_loss).item(),
+                # 'val_melody_consistency': val_melody_consistency
             }
 
-            if loss.item() < best_val_loss:
-                best_val_loss = loss.item()
-                torch.save(checkpoint, LOG_DIR / f'checkpoint_{i}.pt')
+            if val_loss.item() < best_val_loss:
+                best_val_loss = val_loss.item()
+                torch.save(checkpoint, LOG_DIR / f'best_model.pt')
+
 
     if i % GENERATE_EVERY == 0:
         model.eval()
-        inp = random.choice(val_dataset)['input_ids'].to(DEVICE)
-        prime = decode_tokens(inp.tolist(), tokenizer)
-        print('\nprime:', prime)
+        with torch.no_grad():
+            # generate with constant seed
 
-        sample = model.generate(inp[None, ...], GENERATE_LENGTH)
-        combined = torch.cat((inp, sample[0]))
+            gen_const = model.generate(constant_seed[None, ...], GENERATE_LENGTH, temperature=TEMPERATURE)
+            gen_const_midi = decode_tokens(gen_const[0].tolist(), tokenizer)
+            gen_const_midi.dump_midi(GEN_PATH / f"{i}_const_generated.mid")
 
-        sample_decoded = decode_tokens(sample[0].tolist(), tokenizer)
-        sample_decoded.dump_midi(GEN_PATH / f'{i}_sample.mid')
+            combined_const = torch.cat((constant_seed, gen_const[0]))
+            combined_const_midi = decode_tokens(combined_const.tolist(), tokenizer)
+            combined_const_midi.dump_midi(GEN_PATH / f"{i}_const_combined.mid")
 
-        combined_decoded = decode_tokens(combined.tolist(), tokenizer)
-        combined_decoded.dump_midi(GEN_PATH / f'{i}_combined.mid')
-        print('generated:', combined_decoded, '\n')
+            # melody_consistency_const = calculate_melody_consistency_score(
+            #     constant_seed.tolist(), gen_const[0].tolist(), tokenizer
+            # )
+
+            # generate with random seed
+
+            seed = random.choice(val_dataset)['input_ids'].to(DEVICE)
+            generated = model.generate(seed[None, ...], GENERATE_LENGTH, temperature=TEMPERATURE)
+            combined = torch.cat((seed, generated[0]))
+
+            seed_midi = decode_tokens(seed.tolist(), tokenizer)
+            generated_midi = decode_tokens(generated[0].tolist(), tokenizer)
+            combined_midi = decode_tokens(combined.tolist(), tokenizer)
+
+            seed_midi.dump_midi(GEN_PATH / f"{i}_seed.mid")
+            generated_midi.dump_midi(GEN_PATH / f"{i}_generated.mid")
+            combined_midi.dump_midi(GEN_PATH / f"{i}_combined.mid")
+
+            print("\ngeneration complete\n")
 
 writer.close()

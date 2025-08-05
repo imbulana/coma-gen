@@ -9,8 +9,8 @@ from torch.nn import Module, ModuleList
 
 from einops import rearrange, einsum
 
-from local_attention.local_attention import LocalAttention
-from local_attention.rotary import apply_rotary_pos_emb
+from src.local_attention import LocalAttention
+from src.rotary import apply_rotary_pos_emb
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
 
@@ -268,7 +268,7 @@ class LocalTransformer(Module):
         self.has_embed_unembed = exists(num_tokens)
 
         if self.has_embed_unembed:
-            self.token_emb = nn.Embedding(num_tokens, dim)
+            self.token_emb = nn.Embedding(num_tokens, dim, padding_idx = ignore_index)
             self.pos_emb = nn.Embedding(max_seq_len, dim)
 
         self.max_seq_len = max_seq_len
