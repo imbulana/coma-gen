@@ -1,6 +1,7 @@
 torch
 einops
 miditok
+hyper_connections
 
 tensorboard
 tqdm
