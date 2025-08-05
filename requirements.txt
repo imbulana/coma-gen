@@ -2,6 +2,7 @@ torch
 einops
 miditok
 hyper_connections
+scikit-learn
 
 tensorboard
 tqdm
