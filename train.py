@@ -245,16 +245,25 @@ val_loader = cycle(DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
 model = LocalTransformer(
     num_tokens = len(tokenizer), # vocab size
     dim = DIM,
+    dim_head = DIM_HEAD,
+    heads = HEADS,
+    ff_mult = FF_MULT,
     depth = DEPTH,
     causal = CAUSAL,
     # local_attn_window_size = ATTN_WINDOW_SIZE,
     attn_window_sizes = ATTN_WINDOW_SIZES,
     max_seq_len = MAX_SEQ_LEN,
     use_dynamic_pos_bias = USE_DYNAMIC_POS_BIAS,
-    ignore_index = tokenizer["PAD_None"]
+    ignore_index = tokenizer["PAD_None"],
+    attn_dropout = ATTN_DROPOUT,
+    ff_dropout = FF_DROPOUT,
+    conv_dropout = CONV_DROPOUT,
+    conv_expansion_factor = CONV_EXPANSION_FACTOR,
+    conv_kernel_size = CONV_KERNEL_SIZE,
 ).to(DEVICE)
 
 print(f"\nmodel size: {sum(p.numel() for p in model.parameters()):,}")
+print(model)
 
 # optimizer and loss
 
@@ -344,7 +353,7 @@ for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optim.state_dict(),
                 'epoch': i,
-                'train_loss': train_avg_nll,  # Correct training loss
+                'train_loss': train_avg_nll,
                 'val_loss': val_loss,
                 'perplexity': val_ppl,
                 # 'val_melody_consistency': val_melody_consistency

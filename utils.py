@@ -29,11 +29,18 @@ def save_config(writer):
 
         "MODEL_PARAMS": {
             "DIM": DIM,
+            "DIM_HEAD": DIM_HEAD,
+            "HEADS": HEADS,
+            "FF_MULT": FF_MULT,
             "DEPTH": DEPTH,
             "CAUSAL": CAUSAL,
             "USE_DYNAMIC_POS_BIAS": USE_DYNAMIC_POS_BIAS,
-            # "ATTN_WINDOW_SIZE": ATTN_WINDOW_SIZE,
             "ATTN_WINDOW_SIZES": ATTN_WINDOW_SIZES,
+            "CONV_EXPANSION_FACTOR": CONV_EXPANSION_FACTOR,
+            "CONV_KERNEL_SIZE": CONV_KERNEL_SIZE,
+            "CONV_DROPOUT": CONV_DROPOUT,
+            "FF_DROPOUT": FF_DROPOUT,
+            "ATTN_DROPOUT": ATTN_DROPOUT,
         },
 
         "GENERATE_PARAMS": {

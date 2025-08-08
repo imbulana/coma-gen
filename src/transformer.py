@@ -18,7 +18,7 @@ from src.local_attention import LocalAttention
 from src.rotary import apply_rotary_pos_emb
 from hyper_connections import get_init_and_expand_reduce_stream_functions
 
-# helper function
+# helpers
 
 def exists(val):
     return val is not None
@@ -270,21 +270,21 @@ class MultiscaleLocalMHA(nn.Module):
 
 # feedforward
 
-class GEGLU(Module):
-    def forward(self, x):
-        x, gate = x.chunk(2, dim = -1)
-        return x * F.gelu(gate)
+# class GEGLU(Module):
+#     def forward(self, x):
+#         x, gate = x.chunk(2, dim = -1)
+#         return x * F.gelu(gate)
 
-def FeedForward(dim, mult = 4, dropout = 0.):
-    inner_dim = int(dim * mult * 2 / 3)
+# def FeedForward(dim, mult = 4, dropout = 0.):
+#     inner_dim = int(dim * mult * 2 / 3)
 
-    return nn.Sequential(
-        nn.LayerNorm(dim),
-        nn.Linear(dim, inner_dim * 2, bias = False),
-        GEGLU(),
-        nn.Dropout(dropout),
-        nn.Linear(inner_dim, dim, bias = False)
-    )
+#     return nn.Sequential(
+#         nn.LayerNorm(dim),
+#         nn.Linear(dim, inner_dim * 2, bias = False),
+#         GEGLU(),
+#         nn.Dropout(dropout),
+#         nn.Linear(inner_dim, dim, bias = False)
+#     )
 
 # dynamic positional bias
 
@@ -321,92 +321,6 @@ class DynamicPositionBias(Module):
 
         bias = rearrange(bias[rel_dist_indices], 'i j h -> h i j')
         return bias
-
-
-# rotary embedding
-
-class RotaryEmbedding(Module):
-    def __init__(self, dim, theta = 10000):
-        super().__init__()
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent = False)
-
-    @property
-    def device(self):
-        return next(self.buffers()).device
-
-    @autocast('cuda', enabled = False)
-    def forward(self, seq_len):
-        t = torch.arange(seq_len, device = self.device).type_as(self.inv_freq)
-        freqs = torch.einsum('i , j -> i j', t, self.inv_freq)
-        freqs = torch.cat((freqs, freqs), dim = -1)
-        return freqs
-
-def rotate_half(x):
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-@autocast('cuda', enabled = False)
-def apply_rotary_pos_emb(pos, t):
-    return (t * pos.cos()) + (rotate_half(t) * pos.sin())
-
-# t5 relative positional bias
-
-class T5RelativePositionBias(Module):
-    def __init__(
-        self,
-        scale = 1.,
-        num_buckets = 32,
-        max_distance = 128,
-        heads = 8
-    ):
-        super().__init__()
-        self.scale = scale
-        self.num_buckets = num_buckets
-        self.max_distance = max_distance
-        self.relative_attention_bias = nn.Embedding(num_buckets, heads)
-
-    @staticmethod
-    def _relative_position_bucket(
-        relative_position,
-        num_buckets = 32,
-        max_distance = 128
-    ):
-        ret = 0
-        n = -relative_position
-
-        num_buckets //= 2
-        ret += (n < 0).long() * num_buckets
-        n = torch.abs(n)
-
-        max_exact = num_buckets // 2
-        is_small = n < max_exact
-
-        val_if_large = max_exact + (
-            torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
-        ).long()
-
-        val_if_large = torch.min(
-            val_if_large,
-            torch.full_like(val_if_large, num_buckets - 1)
-        )
-
-        ret += torch.where(is_small, n, val_if_large)
-        return ret
-
-    @property
-    def device(self):
-        return next(self.parameters()).device
-
-    def forward(self, n):
-        pos = torch.arange(n, device = self.device).long()
-        rel_pos = rearrange(pos, 'j -> 1 j') - rearrange(pos, 'i -> i 1')
-
-        rp_bucket = self._relative_position_bucket(rel_pos, num_buckets = self.num_buckets, max_distance = self.max_distance)
-        values = self.relative_attention_bias(rp_bucket)
-
-        bias = rearrange(values, 'i j h -> h i j')
-        return bias * self.scale
 
 # conformer
 
@@ -473,75 +387,6 @@ class PreNorm(Module):
     def forward(self, x, **kwargs):
         x = self.norm(x)
         return self.fn(x, **kwargs)
-
-class Attention(Module):
-    def __init__(
-        self,
-        dim,
-        heads = 8,
-        dim_head = 64,
-        dropout = 0.,
-        flash = True,
-        has_value_residual_mix = False
-    ):
-        super().__init__()
-        inner_dim = dim_head * heads
-        self.heads = heads
-        self.scale = dim_head ** -0.5
-
-        self.attend = Attend(
-            flash = flash,
-            dropout = dropout
-        )
-
-        self.dropout = nn.Dropout(dropout)
-
-        self.to_q = nn.Linear(dim, inner_dim, bias = False)
-        self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
-
-        self.to_value_residual_mix = nn.Sequential(
-            nn.Linear(dim, heads, bias = False),
-            Rearrange('b n h -> b h n 1'),
-            nn.Sigmoid()
-        ) if has_value_residual_mix else None
-
-        self.to_out = nn.Linear(inner_dim, dim)
-
-    def forward(
-        self,
-        x,
-        context = None,
-        mask = None,
-        rotary_emb = None,
-        attn_bias = None,
-        return_values = False,
-        value_residual = None
-    ):
-        assert xnor(exists(value_residual), exists(self.to_value_residual_mix))
-
-        n, device, h, has_context = x.shape[-2], x.device, self.heads, exists(context)
-        context = default(context, x)
-
-        q, k, v = (self.to_q(x), *self.to_kv(context).chunk(2, dim = -1))
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
-
-        if exists(value_residual):
-            mix = self.to_value_residual_mix(x)
-            v = v.lerp(value_residual, mix)
-
-        if exists(rotary_emb):
-            q = apply_rotary_pos_emb(rotary_emb, q)
-            k = apply_rotary_pos_emb(rotary_emb, k)
-
-        out = self.attend(q, k, v, mask = mask, attn_bias = attn_bias)
-
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        out = self.to_out(out)
-
-        if not return_values:
-            return out
-
-        return out, v
 
 class FeedForward(Module):
     def __init__(
@@ -618,6 +463,9 @@ class LocalTransformer(Module):
         ff_mult = 4,
         attn_dropout = 0.,
         ff_dropout = 0.,
+        conv_dropout = 0.,
+        conv_expansion_factor = 2,
+        conv_kernel_size = 17,
         ignore_index = 0,
         use_xpos = False,
         xpos_scale_base = None,
@@ -670,7 +518,14 @@ class LocalTransformer(Module):
                 nn.ModuleList([
                     init_hyper_conn(
                         dim = dim, 
-                        branch = MultiscaleLocalMHA(
+                        branch = Scale(
+                            scale = .5, 
+                            fn = PreNorm(dim, FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout))
+                        )
+                    ),
+                    init_hyper_conn(
+                        dim = dim, 
+                        branch = PreNorm(dim, MultiscaleLocalMHA(
                         # branch = LocalMHA(
                             dim = dim, 
                             dim_head = dim_head, 
@@ -682,16 +537,31 @@ class LocalTransformer(Module):
                             use_xpos = use_xpos, 
                             xpos_scale_base = xpos_scale_base, 
                             use_rotary_pos_emb = not use_dynamic_pos_bias, 
-                            prenorm = True, 
+                            prenorm = False, 
                             **kwargs
+                        ))
+                    ),
+                    init_hyper_conn(
+                        dim = dim,
+                        branch = ConformerConvModule(
+                            dim = dim,
+                            causal = causal,
+                            expansion_factor = conv_expansion_factor,
+                            kernel_size = conv_kernel_size,
+                            dropout = conv_dropout
                         )
                     ),
                     init_hyper_conn(
                         dim = dim, 
-                        branch = FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
+                        branch = Scale(
+                            scale = .5, 
+                            fn = PreNorm(dim, FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout))
+                        )
                     )
                 ])
             )
+
+        self.post_norm = nn.LayerNorm(dim)
 
         self.ignore_index = ignore_index
 
@@ -792,10 +662,12 @@ class LocalTransformer(Module):
 
         x = self.expand_streams(x)
 
-        for (attn, ff), global_layer in zip(self.layers, self.global_layers):
+        for (ff1, attn, conv, ff2), global_layer in zip(self.layers, self.global_layers):
 
             if exists(global_layer):
                 x = global_layer(x)
+
+            x = ff1(x)
 
             x, layer_cached_kv = attn(
                 x,
@@ -807,7 +679,10 @@ class LocalTransformer(Module):
 
             new_cached_kv.append(layer_cached_kv)
 
-            x = ff(x)
+            x = conv(x, mask = mask)
+            x = ff2(x)
+
+            x = self.post_norm(x)
 
         x = self.reduce_streams(x)
 
