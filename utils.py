@@ -32,7 +32,8 @@ def save_config(writer):
             "DEPTH": DEPTH,
             "CAUSAL": CAUSAL,
             "USE_DYNAMIC_POS_BIAS": USE_DYNAMIC_POS_BIAS,
-            "ATTN_WINDOW_SIZE": ATTN_WINDOW_SIZE,
+            # "ATTN_WINDOW_SIZE": ATTN_WINDOW_SIZE,
+            "ATTN_WINDOW_SIZES": ATTN_WINDOW_SIZES,
         },
 
         "GENERATE_PARAMS": {

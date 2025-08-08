@@ -214,6 +214,9 @@ if _SHUFFLE_RECORDINGS:
     midi_paths_train = X_train.tolist()
     midi_paths_valid = X_test.tolist()
 
+    print(f"\nselected {len(midi_paths_train)} train samples")
+    print(f"\nselected {len(midi_paths_valid)} valid samples")
+
 # define datasets and dataloaders
 
 # get_composer_label = (
@@ -244,8 +247,8 @@ model = LocalTransformer(
     dim = DIM,
     depth = DEPTH,
     causal = CAUSAL,
-    local_attn_window_size = ATTN_WINDOW_SIZE,
-    # local_attn_window_sizes = ATTN_WINDOW_SIZES,
+    # local_attn_window_size = ATTN_WINDOW_SIZE,
+    attn_window_sizes = ATTN_WINDOW_SIZES,
     max_seq_len = MAX_SEQ_LEN,
     use_dynamic_pos_bias = USE_DYNAMIC_POS_BIAS,
     ignore_index = tokenizer["PAD_None"]
@@ -256,10 +259,19 @@ print(f"\nmodel size: {sum(p.numel() for p in model.parameters()):,}")
 # optimizer and loss
 
 optim = Adam(model.parameters(), lr=LEARNING_RATE) # TODO: try AdamW
-criterion = lambda logits, labels: F.cross_entropy(
+
+pad_id = tokenizer["PAD_None"]
+nll_sum = lambda logits, labels: F.cross_entropy(
     rearrange(logits, 'b n c -> b c n'),
     labels,
-    ignore_index = tokenizer["PAD_None"]
+    ignore_index=pad_id,
+    reduction='sum'
+)
+nll_mean = lambda logits, labels: F.cross_entropy(
+    rearrange(logits, 'b n c -> b c n'),
+    labels,
+    ignore_index=pad_id,
+    reduction = 'mean'
 )
 
 # training
@@ -272,9 +284,8 @@ best_val_loss = float('inf')
 for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     model.train()
     
-    train_loss = 0.
+    total_loss, total_tokens = 0.0, 0
     # train_melody_consistency_total = 0.
-
     for _ in range(GRADIENT_ACCUMULATE_EVERY):
         inp, mask = next(train_loader)
 
@@ -283,29 +294,24 @@ for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
 
         logits = model(inp, mask=mask)
 
-        loss = criterion(logits, labels)
-        loss.backward()
+        # accumulate summed NLL and token count
+        loss_sum = nll_sum(logits, labels)
+        total_loss += loss_sum
 
-        train_loss += loss.item()
+        total_tokens += (labels != pad_id).sum()
 
-        # filtered_logits = top_k(logits[:, -1], thres = FILTER_THRES)
+        # use mean loss to keep gradients invariant to token count
+        loss_mean = nll_mean(logits, labels)
+        (loss_mean / GRADIENT_ACCUMULATE_EVERY).backward()
 
-        # if TEMPERATURE == 0.:
-        #     sampled = filtered_logits.argmax(dim = -1, keepdim = True)
-        # else:
-        #     probs = F.softmax(filtered_logits / TEMPERATURE, dim = -1)
-        #     sampled = torch.multinomial(probs, 1)
+    train_avg_nll = total_loss / total_tokens
+    train_ppl = torch.exp(train_avg_nll)
 
-        # train_melody_consistency_total += calculate_melody_consistency_from_logits(logits, labels, tokenizer)
-    
-    train_loss /= GRADIENT_ACCUMULATE_EVERY
-    # train_melody_consistency = train_melody_consistency_total / GRADIENT_ACCUMULATE_EVERY
-
-    print(f'training loss: {train_loss:.4f}, perplexity: {torch.exp(torch.tensor(train_loss)).item():.4f}')
+    print(f'training loss: {train_avg_nll:.4f}, perplexity: {train_ppl:.4f}')
     
     # log to tensorboard
-    writer.add_scalar('Loss/Train', train_loss, i)
-    writer.add_scalar('Perplexity/Train', torch.exp(torch.tensor(train_loss)).item(), i)
+    writer.add_scalar('Loss/Train', train_avg_nll, i)
+    writer.add_scalar('Perplexity/Train', train_ppl, i)
     
     # writer.add_scalar('Melody_Consistency/Train', train_melody_consistency, i)
     # print(f'training melody consistency: {train_melody_consistency:.4f}')
@@ -322,14 +328,15 @@ for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
             mask = mask[:, :-1]
 
             logits = model(inp, mask=mask)
-            val_loss = criterion(logits, labels)
+            val_loss = nll_mean(logits, labels)
+            val_ppl = torch.exp(val_loss)
             
             # val_melody_consistency = calculate_batch_melody_consistency(inp, model, tokenizer)
             # print(f'validation melody consistency: {val_melody_consistency:.4f}')
             
             # Log validation metrics
-            writer.add_scalar('Loss/Validation', val_loss.item(), i)
-            writer.add_scalar('Perplexity/Validation', torch.exp(val_loss).item(), i)
+            writer.add_scalar('Loss/Validation', val_loss, i)
+            writer.add_scalar('Perplexity/Validation', val_ppl, i)
             # writer.add_scalar('Melody_Consistency/Validation', val_melody_consistency, i)
             
             # Save model checkpoint
@@ -337,14 +344,61 @@ for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optim.state_dict(),
                 'epoch': i,
-                'train_loss': train_loss,  # Correct training loss
-                'val_loss': val_loss.item(),  # Correct validation loss
-                'perplexity': torch.exp(val_loss).item(),
+                'train_loss': train_avg_nll,  # Correct training loss
+                'val_loss': val_loss,
+                'perplexity': val_ppl,
                 # 'val_melody_consistency': val_melody_consistency
             }
 
-            if val_loss.item() < best_val_loss:
-                best_val_loss = val_loss.item()
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(checkpoint, LOG_DIR / f'best_model.pt')
+
+    if i % VALIDATE_ALL_EVERY == 0 and i != 0:
+        model.eval()
+        with torch.no_grad():
+            # evaluate over the entire validation set
+            val_epoch_loader = DataLoader(
+                val_dataset,
+                batch_size=BATCH_SIZE,
+                shuffle=False,
+                collate_fn=collator_left_pad
+            )
+
+            val_total_loss, val_total_tokens = 0.0, 0
+            for batch in val_epoch_loader:
+                inp = batch['input_ids'].to(DEVICE)
+                mask = batch['attention_mask'].bool().to(DEVICE)
+
+                inp, labels = inp[:, :-1], inp[:, 1:]
+                mask = mask[:, :-1]
+
+                logits = model(inp, mask=mask)
+                loss_sum = nll_sum(logits, labels)
+                val_total_loss += loss_sum
+                val_total_tokens += (labels != pad_id).sum()
+
+            val_avg_nll = val_total_loss / val_total_tokens
+            val_ppl = torch.exp(val_avg_nll)
+
+            # Log validation metrics
+            writer.add_scalar('Loss/Validation', val_avg_nll, i)
+            writer.add_scalar('Perplexity/Validation', val_ppl, i)
+            # writer.add_scalar('Melody_Consistency/Validation', val_melody_consistency, i)
+            
+            # Save model checkpoint
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optim.state_dict(),
+                'epoch': i,
+                'train_loss': train_avg_nll,
+                'val_loss': val_avg_nll,
+                'perplexity': val_ppl,
+                # 'val_melody_consistency': val_melody_consistency
+            }
+
+            if val_avg_nll < best_val_loss:
+                best_val_loss = val_avg_nll
                 torch.save(checkpoint, LOG_DIR / f'best_model.pt')
 
 

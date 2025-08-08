@@ -21,8 +21,8 @@ SPLIT_DATA = False
 MAX_SEQ_LEN = 1024
 SHUFFLE = True
 SORT_BY = 'compositions' # must be in ['compositions', 'duration']
-TEST_SIZE = 0.2
-TOP_K_COMPOSERS = 10 # select top K composers by SORT_BY type to train/test on
+TEST_SIZE = 0.1
+TOP_K_COMPOSERS = 5 # select top K composers by SORT_BY type to train/test on
 TO_SKIP = [] # composers to skip
 AUGMENT_DATA = False
 
@@ -56,9 +56,8 @@ DIM = 512
 DEPTH = 4
 CAUSAL = True
 USE_DYNAMIC_POS_BIAS = True
-ATTN_WINDOW_SIZE = 64
-
-# ATTN_WINDOWS_SIZES = [32, 64]
+# ATTN_WINDOW_SIZE = 64
+ATTN_WINDOW_SIZES = [64, 128]
 
 # CONV_EXPANSION_FACTOR = 2
 # CONV_KERNEL_SIZE = 4
@@ -74,6 +73,7 @@ BATCH_SIZE = 8
 
 GRADIENT_ACCUMULATE_EVERY = 4
 VALIDATE_EVERY  = 150 # ~1 epoch for maestro
+VALIDATE_ALL_EVERY = 1000
 
 GENERATE_EVERY  = 25
 GENERATE_LENGTH = 1024
