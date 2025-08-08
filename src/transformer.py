@@ -1,17 +1,21 @@
 from __future__ import annotations
 from copy import deepcopy
 from collections import namedtuple
+import math
+from random import random
 
 import torch
 from torch import nn
+from torch.amp import autocast
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
+# from torch import einsum
 from einops import rearrange, einsum
+from einops.layers.torch import Rearrange
 
 from src.local_attention import LocalAttention
 from src.rotary import apply_rotary_pos_emb
-
 from hyper_connections import get_init_and_expand_reduce_stream_functions
 
 # helper function
@@ -24,6 +28,16 @@ def default(val, d):
 
 def l2norm(t):
     return F.normalize(t, dim = -1)
+
+def xnor(x, y):
+    return not (x ^ y)
+
+def divisible_by(numer, denom):
+    return (numer % denom) == 0
+
+def calc_same_padding(kernel_size):
+    pad = kernel_size // 2
+    return (pad, pad - (kernel_size + 1) % 2)
 
 def eval_decorator(fn):
     def inner(model, *args, **kwargs):
@@ -54,7 +68,7 @@ class LocalMHA(Module):
         dim_head = 64,
         heads = 8,
         dropout = 0.,
-        causal = False,
+        causal = True,
         prenorm = False,
         qk_rmsnorm = False,
         qk_scale = 8,
@@ -181,6 +195,79 @@ class LocalMHA(Module):
 
         return out, kv
 
+class MultiscaleLocalMHA(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        attn_window_sizes=[8, 16, 32],
+        dim_head=64,
+        heads=8,
+        dropout=0.,
+        causal=True,
+        prenorm=True,
+        qk_rmsnorm=False,
+        qk_scale=8,
+        **kwargs
+    ):
+        super().__init__()
+        self.scales = nn.ModuleList([
+            LocalMHA(
+                dim=dim,
+                window_size=window_size,
+                dim_head=dim_head,
+                heads=heads,
+                dropout=dropout,
+                causal=causal,
+                prenorm=prenorm,
+                qk_rmsnorm=qk_rmsnorm,
+                qk_scale=qk_scale,
+                **kwargs
+            ) for window_size in attn_window_sizes
+        ])
+        self.scale_weights = (
+            nn.Parameter(torch.ones(len(attn_window_sizes)) / len(attn_window_sizes)) 
+            if len(attn_window_sizes) > 1 else None
+        )
+
+    def forward(self, x, mask=None, attn_bias=None, cache=None, return_cache=False):
+        outs = []
+        new_caches = []
+        
+        # If we have cache, it should be a list for each scale
+        cache_list = cache if cache is not None else [None] * len(self.scales)
+        
+        for i, attn in enumerate(self.scales):
+            layer_cache = cache_list[i] if i < len(cache_list) else None
+            
+            if return_cache:
+                out, layer_cached_kv = attn(
+                    x,
+                    mask=mask, 
+                    attn_bias=attn_bias, 
+                    cache=layer_cache, 
+                    return_cache=True
+                )
+                new_caches.append(layer_cached_kv)
+            else:
+                out = attn(x, mask=mask, attn_bias=attn_bias, cache=layer_cache)
+            
+            if exists(mask):
+                out = out.masked_fill(~mask.unsqueeze(-1), 0.)
+            outs.append(out)
+        
+        if exists(self.scale_weights):
+            outs = torch.stack(outs, dim=0)
+            weights = torch.softmax(self.scale_weights, dim=0)
+            final_out = einsum(outs, weights, 's b n d, s -> b n d')
+        else:
+            final_out = outs[0]
+        
+        if return_cache:
+            return final_out, new_caches
+        else:
+            return final_out
+
 # feedforward
 
 class GEGLU(Module):
@@ -235,6 +322,282 @@ class DynamicPositionBias(Module):
         bias = rearrange(bias[rel_dist_indices], 'i j h -> h i j')
         return bias
 
+
+# rotary embedding
+
+class RotaryEmbedding(Module):
+    def __init__(self, dim, theta = 10000):
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent = False)
+
+    @property
+    def device(self):
+        return next(self.buffers()).device
+
+    @autocast('cuda', enabled = False)
+    def forward(self, seq_len):
+        t = torch.arange(seq_len, device = self.device).type_as(self.inv_freq)
+        freqs = torch.einsum('i , j -> i j', t, self.inv_freq)
+        freqs = torch.cat((freqs, freqs), dim = -1)
+        return freqs
+
+def rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+@autocast('cuda', enabled = False)
+def apply_rotary_pos_emb(pos, t):
+    return (t * pos.cos()) + (rotate_half(t) * pos.sin())
+
+# t5 relative positional bias
+
+class T5RelativePositionBias(Module):
+    def __init__(
+        self,
+        scale = 1.,
+        num_buckets = 32,
+        max_distance = 128,
+        heads = 8
+    ):
+        super().__init__()
+        self.scale = scale
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.relative_attention_bias = nn.Embedding(num_buckets, heads)
+
+    @staticmethod
+    def _relative_position_bucket(
+        relative_position,
+        num_buckets = 32,
+        max_distance = 128
+    ):
+        ret = 0
+        n = -relative_position
+
+        num_buckets //= 2
+        ret += (n < 0).long() * num_buckets
+        n = torch.abs(n)
+
+        max_exact = num_buckets // 2
+        is_small = n < max_exact
+
+        val_if_large = max_exact + (
+            torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
+        ).long()
+
+        val_if_large = torch.min(
+            val_if_large,
+            torch.full_like(val_if_large, num_buckets - 1)
+        )
+
+        ret += torch.where(is_small, n, val_if_large)
+        return ret
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def forward(self, n):
+        pos = torch.arange(n, device = self.device).long()
+        rel_pos = rearrange(pos, 'j -> 1 j') - rearrange(pos, 'i -> i 1')
+
+        rp_bucket = self._relative_position_bucket(rel_pos, num_buckets = self.num_buckets, max_distance = self.max_distance)
+        values = self.relative_attention_bias(rp_bucket)
+
+        bias = rearrange(values, 'i j h -> h i j')
+        return bias * self.scale
+
+# conformer
+
+class Swish(Module):
+    def forward(self, x):
+        return x * x.sigmoid()
+
+class GLU(Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        out, gate = x.chunk(2, dim=self.dim)
+        return out * gate.sigmoid()
+
+class DepthWiseConv1d(Module):
+    def __init__(self, chan_in, chan_out, kernel_size, padding):
+        super().__init__()
+        self.padding = padding
+        self.conv = nn.Conv1d(chan_in, chan_out, kernel_size, groups = chan_in)
+
+    def forward(self, x, mask = None):
+        if exists(mask):
+            mask = rearrange(mask, 'b n -> b 1 n')
+            x = x.masked_fill(~mask, 0.)
+
+        x = F.pad(x, self.padding)
+        out = self.conv(x)
+
+        if exists(mask):
+            out = out.masked_fill(~mask, 0.)
+
+        return out
+
+# attention, feedforward, and conv module
+
+class Scale(Module):
+    def __init__(self, scale, fn):
+        super().__init__()
+        self.fn = fn
+        self.scale = scale
+
+    def forward(self, x, **kwargs):
+        return self.fn(x, **kwargs) * self.scale
+
+class ChanLayerNorm(Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(1, dim, 1))
+
+    def forward(self, x):
+        eps = 1e-6 if x.dtype == torch.float32 else 1e-4
+        var = torch.var(x, dim = 1, unbiased = False, keepdim = True)
+        mean = torch.mean(x, dim = 1, keepdim = True)
+        return (x - mean) * var.clamp(min = eps).rsqrt() * self.gamma
+
+class PreNorm(Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.fn = fn
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x, **kwargs):
+        x = self.norm(x)
+        return self.fn(x, **kwargs)
+
+class Attention(Module):
+    def __init__(
+        self,
+        dim,
+        heads = 8,
+        dim_head = 64,
+        dropout = 0.,
+        flash = True,
+        has_value_residual_mix = False
+    ):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.attend = Attend(
+            flash = flash,
+            dropout = dropout
+        )
+
+        self.dropout = nn.Dropout(dropout)
+
+        self.to_q = nn.Linear(dim, inner_dim, bias = False)
+        self.to_kv = nn.Linear(dim, inner_dim * 2, bias = False)
+
+        self.to_value_residual_mix = nn.Sequential(
+            nn.Linear(dim, heads, bias = False),
+            Rearrange('b n h -> b h n 1'),
+            nn.Sigmoid()
+        ) if has_value_residual_mix else None
+
+        self.to_out = nn.Linear(inner_dim, dim)
+
+    def forward(
+        self,
+        x,
+        context = None,
+        mask = None,
+        rotary_emb = None,
+        attn_bias = None,
+        return_values = False,
+        value_residual = None
+    ):
+        assert xnor(exists(value_residual), exists(self.to_value_residual_mix))
+
+        n, device, h, has_context = x.shape[-2], x.device, self.heads, exists(context)
+        context = default(context, x)
+
+        q, k, v = (self.to_q(x), *self.to_kv(context).chunk(2, dim = -1))
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
+
+        if exists(value_residual):
+            mix = self.to_value_residual_mix(x)
+            v = v.lerp(value_residual, mix)
+
+        if exists(rotary_emb):
+            q = apply_rotary_pos_emb(rotary_emb, q)
+            k = apply_rotary_pos_emb(rotary_emb, k)
+
+        out = self.attend(q, k, v, mask = mask, attn_bias = attn_bias)
+
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = self.to_out(out)
+
+        if not return_values:
+            return out
+
+        return out, v
+
+class FeedForward(Module):
+    def __init__(
+        self,
+        dim,
+        mult = 4,
+        dropout = 0.
+    ):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim * mult),
+            Swish(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * mult, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class ConformerConvModule(Module):
+    def __init__(
+        self,
+        dim,
+        causal = True,
+        expansion_factor = 2,
+        kernel_size = 31,
+        dropout = 0.
+    ):
+        super().__init__()
+
+        inner_dim = dim * expansion_factor
+        padding = calc_same_padding(kernel_size) if not causal else (kernel_size - 1, 0)
+
+        self.net1 = nn.Sequential(
+            nn.LayerNorm(dim),
+            Rearrange('b n c -> b c n'),
+            nn.Conv1d(dim, inner_dim * 2, 1),
+            GLU(dim=1)
+        )
+
+        self.ds_conv = DepthWiseConv1d(inner_dim, inner_dim, kernel_size = kernel_size, padding = padding)
+
+        self.net2 = nn.Sequential(
+            Swish(),
+            ChanLayerNorm(inner_dim),
+            nn.Conv1d(inner_dim, dim, 1),
+            Rearrange('b c n -> b n c'),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x, mask = None):
+        x = self.net1(x)
+        x = self.ds_conv(x, mask = mask)
+        return self.net2(x)
+
 # main transformer class
 
 Cache = namedtuple('Cache', ['cache_kv', 'maybe_cached_attn_bias'])
@@ -248,7 +611,8 @@ class LocalTransformer(Module):
         dim,
         depth,
         causal = True,
-        local_attn_window_size = 512,
+        # local_attn_window_size = 512,
+        attn_window_sizes = [16, 32, 64],
         dim_head = 64,
         heads = 8,
         ff_mult = 4,
@@ -274,7 +638,8 @@ class LocalTransformer(Module):
         self.max_seq_len = max_seq_len
         self.layers = ModuleList([])
 
-        self.local_attn_window_size = local_attn_window_size
+        # self.local_attn_window_sizes = local_attn_window_size
+        self.attn_window_sizes = attn_window_sizes
         self.dynamic_pos_bias = None
         if use_dynamic_pos_bias:
             self.dynamic_pos_bias = DynamicPositionBias(dim = dim // 2, heads = heads)
@@ -305,13 +670,15 @@ class LocalTransformer(Module):
                 nn.ModuleList([
                     init_hyper_conn(
                         dim = dim, 
-                        branch = LocalMHA(
+                        branch = MultiscaleLocalMHA(
+                        # branch = LocalMHA(
                             dim = dim, 
                             dim_head = dim_head, 
                             heads = heads, 
                             dropout = attn_dropout, 
                             causal = causal, 
-                            window_size = local_attn_window_size, 
+                            attn_window_sizes = attn_window_sizes, 
+                            # window_size = attn_window_sizes[0],
                             use_xpos = use_xpos, 
                             xpos_scale_base = xpos_scale_base, 
                             use_rotary_pos_emb = not use_dynamic_pos_bias, 
@@ -415,10 +782,10 @@ class LocalTransformer(Module):
 
         # dynamic pos bias
 
-        attn_bias = cached_attn_bias
+        attn_bias= cached_attn_bias
 
         if not exists(attn_bias) and exists(self.dynamic_pos_bias):
-            w = self.local_attn_window_size
+            w = max(self.attn_window_sizes)  # NOTE: use the largest window size for dynamic pos bias
             attn_bias = self.dynamic_pos_bias(w, w * 2)
 
         # go through layers
@@ -433,7 +800,7 @@ class LocalTransformer(Module):
             x, layer_cached_kv = attn(
                 x,
                 mask = mask,
-                attn_bias = attn_bias,
+                attn_bias = None,
                 return_cache = True,
                 cache = next(iter_cached_kv, None)
             )
