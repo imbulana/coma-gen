@@ -1,16 +1,12 @@
 from __future__ import annotations
 from copy import deepcopy
 from collections import namedtuple
-import math
-from random import random
 
 import torch
 from torch import nn
-from torch.amp import autocast
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
-# from torch import einsum
 from einops import rearrange, einsum
 from einops.layers.torch import Rearrange
 
@@ -70,9 +66,9 @@ class LocalMHA(Module):
         dropout = 0.,
         causal = True,
         prenorm = False,
-        qk_rmsnorm = False,
+        qk_rmsnorm = True,
         qk_scale = 8,
-        use_xpos = False,
+        use_xpos = True,
         xpos_scale_base = None,
         exact_windowsize = None,
         gate_values_per_head = False,
@@ -145,7 +141,7 @@ class LocalMHA(Module):
 
             ck, cv = cache
 
-            q = q * (q.shape[-1] ** -0.5)
+            q = q * default(self.attn_fn.scale, (q.shape[-1] ** -0.5))
 
             k = torch.cat((ck, k), dim = -2)
             v = torch.cat((cv, v), dim = -2)
@@ -240,17 +236,26 @@ class MultiscaleLocalMHA(nn.Module):
         for i, attn in enumerate(self.scales):
             layer_cache = cache_list[i] if i < len(cache_list) else None
             
+            # adapt shared attn_bias to per-scale sizes if provided
+            scale_attn_bias = attn_bias
+            if exists(attn_bias):
+                w = attn.attn_fn.window_size
+                j = w * (attn.attn_fn.look_backward + attn.attn_fn.look_forward + 1)
+                if (attn_bias.shape[-2] != w) or (attn_bias.shape[-1] != j):
+                    assert attn_bias.shape[-2] >= w and attn_bias.shape[-1] >= j, "attn_bias has smaller shape than required for this scale"
+                    scale_attn_bias = attn_bias[..., -w:, -j:]
+            
             if return_cache:
                 out, layer_cached_kv = attn(
                     x,
                     mask=mask, 
-                    attn_bias=attn_bias, 
+                    attn_bias=scale_attn_bias, 
                     cache=layer_cache, 
                     return_cache=True
                 )
                 new_caches.append(layer_cached_kv)
             else:
-                out = attn(x, mask=mask, attn_bias=attn_bias, cache=layer_cache)
+                out = attn(x, mask=mask, attn_bias=scale_attn_bias, cache=layer_cache)
             
             if exists(mask):
                 out = out.masked_fill(~mask.unsqueeze(-1), 0.)
@@ -267,24 +272,6 @@ class MultiscaleLocalMHA(nn.Module):
             return final_out, new_caches
         else:
             return final_out
-
-# feedforward
-
-# class GEGLU(Module):
-#     def forward(self, x):
-#         x, gate = x.chunk(2, dim = -1)
-#         return x * F.gelu(gate)
-
-# def FeedForward(dim, mult = 4, dropout = 0.):
-#     inner_dim = int(dim * mult * 2 / 3)
-
-#     return nn.Sequential(
-#         nn.LayerNorm(dim),
-#         nn.Linear(dim, inner_dim * 2, bias = False),
-#         GEGLU(),
-#         nn.Dropout(dropout),
-#         nn.Linear(inner_dim, dim, bias = False)
-#     )
 
 # dynamic positional bias
 
@@ -456,7 +443,6 @@ class LocalTransformer(Module):
         dim,
         depth,
         causal = True,
-        # local_attn_window_size = 512,
         attn_window_sizes = [16, 32, 64],
         dim_head = 64,
         heads = 8,
@@ -486,9 +472,9 @@ class LocalTransformer(Module):
         self.max_seq_len = max_seq_len
         self.layers = ModuleList([])
 
-        # self.local_attn_window_sizes = local_attn_window_size
         self.attn_window_sizes = attn_window_sizes
         self.dynamic_pos_bias = None
+        self.use_xpos = use_xpos
         if use_dynamic_pos_bias:
             self.dynamic_pos_bias = DynamicPositionBias(dim = dim // 2, heads = heads)
 
@@ -526,14 +512,12 @@ class LocalTransformer(Module):
                     init_hyper_conn(
                         dim = dim, 
                         branch = PreNorm(dim, MultiscaleLocalMHA(
-                        # branch = LocalMHA(
                             dim = dim, 
                             dim_head = dim_head, 
                             heads = heads, 
                             dropout = attn_dropout, 
                             causal = causal, 
                             attn_window_sizes = attn_window_sizes, 
-                            # window_size = attn_window_sizes[0],
                             use_xpos = use_xpos, 
                             xpos_scale_base = xpos_scale_base, 
                             use_rotary_pos_emb = not use_dynamic_pos_bias, 
@@ -576,10 +560,11 @@ class LocalTransformer(Module):
     def generate(
         self,
         prime,
+        prime_mask,
         seq_len,
         temperature = 1.,
         filter_thres = 0.9,
-        use_kv_cache = True,
+        use_kv_cache = False,
         **kwargs
     ):
         assert self.has_embed_unembed
@@ -588,13 +573,19 @@ class LocalTransformer(Module):
         n, device = prime.shape[1], prime.device
 
         out = prime
+        # track a running attention mask aligned with `out`
+        out_mask = prime_mask if exists(prime_mask) else torch.ones_like(prime, dtype=torch.bool, device=device)
 
         cache = None
 
         for _ in range(seq_len):
+            # slice to model's max context
+            x_in = out[:, -self.max_seq_len:]
+            m_in = out_mask[:, -self.max_seq_len:] if exists(out_mask) else None
 
             logits, new_cache = self.forward(
-                out[:, -self.max_seq_len:],
+                x_in,
+                mask = m_in,
                 cache = cache,
                 return_cache = True,
                 **kwargs
@@ -612,6 +603,10 @@ class LocalTransformer(Module):
                 sampled = torch.multinomial(probs, 1)
 
             out = torch.cat((out, sampled), dim = -1)
+            # newly sampled token is valid, extend mask accordingly
+            if exists(out_mask):
+                new_valid = torch.ones((out_mask.shape[0], 1), dtype=torch.bool, device=device)
+                out_mask = torch.cat((out_mask, new_valid), dim = -1)
 
         return out[:, n:]
 
@@ -672,7 +667,7 @@ class LocalTransformer(Module):
             x, layer_cached_kv = attn(
                 x,
                 mask = mask,
-                attn_bias = None,
+                attn_bias = attn_bias,
                 return_cache = True,
                 cache = next(iter_cached_kv, None)
             )
@@ -682,9 +677,8 @@ class LocalTransformer(Module):
             x = conv(x, mask = mask)
             x = ff2(x)
 
-            x = self.post_norm(x)
-
         x = self.reduce_streams(x)
+        x = self.post_norm(x)
 
         if not self.has_embed_unembed:
             return x
