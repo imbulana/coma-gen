@@ -4,8 +4,8 @@ from config import *
 
 # data utils
 
-def save_config(writer):
-    config_dict = {
+def build_config_dict():
+    return {
         "SEED": SEED,
         "DEVICE": str(DEVICE),
 
@@ -41,6 +41,8 @@ def save_config(writer):
             "CONV_DROPOUT": CONV_DROPOUT,
             "FF_DROPOUT": FF_DROPOUT,
             "ATTN_DROPOUT": ATTN_DROPOUT,
+            "USE_XPOS": USE_XPOS,
+            "USE_DYNAMIC_POS_BIAS": USE_DYNAMIC_POS_BIAS,
         },
 
         "GENERATE_PARAMS": {
@@ -48,4 +50,6 @@ def save_config(writer):
             "FILTER_THRES": FILTER_THRES,
         },
     }
-    writer.add_text("config", json.dumps(config_dict, indent=2))
+
+def save_config(writer):
+    writer.add_text("config", json.dumps(build_config_dict(), indent=2))

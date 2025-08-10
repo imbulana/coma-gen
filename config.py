@@ -42,7 +42,7 @@ TOKENIZER_PARAMS = {
     "num_velocities": 24,
     "special_tokens": ["PAD", "BOS", "EOS"],
     "use_chords": True,
-    "use_rests": True,
+    "use_rests": False,
     "use_tempos": True,
     "use_time_signatures": True,
     "use_programs": False,  # no multitrack
@@ -58,12 +58,12 @@ HEADS = 8
 FF_MULT = 4
 DEPTH = 4
 CAUSAL = True
+USE_XPOS = True
 USE_DYNAMIC_POS_BIAS = False
-# ATTN_WINDOW_SIZE = 64
 ATTN_WINDOW_SIZES = [32, 64]
 
 CONV_EXPANSION_FACTOR = 2
-CONV_KERNEL_SIZE = 17
+CONV_KERNEL_SIZE = 31
 
 ATTN_DROPOUT = 0.1
 FF_DROPOUT = 0.1
@@ -75,14 +75,14 @@ NUM_BATCHES = int(1e5)
 BATCH_SIZE = 8
 
 GRADIENT_ACCUMULATE_EVERY = 4
-VALIDATE_EVERY = 150 # 1 epoch is ~475 steps
-VALIDATE_ALL_EVERY = 1000
+VALIDATE_EVERY = 150 # 1 epoch = NUM_BATCHES / (BATCH_SIZE * GRADIENT_ACCUMULATE_EVERY)
+VALIDATE_ALL_EVERY = int(1e5)
 
-GENERATE_EVERY  = 25
-GENERATE_LENGTH = 1024
+GENERATE_EVERY  = 50
+GENERATE_LENGTH = 512
 
 LEARNING_RATE = 2e-4
-# LR_SCHEDULER = None # must be in ["CosineAnnealingLR", "MultiStepLR", None]
+LR_SCHEDULER = None # must be in ["CosineAnnealingLR", "MultiStepLR", None]
 # MILESTONES = [7, 14] # for MultiStepLR
 # WEIGHT_DECAY = 2e-4 # 4e-4
 
@@ -96,5 +96,10 @@ GEN_DIR = LOG_DIR / "gen"
 
 # generator params
 
-TEMPERATURE = 1.2
-FILTER_THRES = 0.9
+TEMPERATURE = .9
+FILTER_THRES = .9
+
+# checkpointing / resume
+# Set to a checkpoint path to resume training, e.g.
+# RESUME_CHECKPOINT = Path("logs/k=5_20250101_120000/best_model.pt").resolve()
+RESUME_CHECKPOINT = None

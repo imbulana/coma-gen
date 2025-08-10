@@ -1,4 +1,5 @@
 import os
+import json
 import random
 import shutil
 import pandas as pd
@@ -6,6 +7,8 @@ from tqdm import tqdm
 
 import torch
 from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 from torch.utils.data import DataLoader
 from torch.nn import functional as F
 from einops import rearrange
@@ -23,10 +26,43 @@ from src import LocalTransformer
 # load config
 
 from config import *
-from utils import save_config
+from utils import save_config, build_config_dict
+
+_APPLIED_CFG = None
+if RESUME_CHECKPOINT is not None and os.path.exists(RESUME_CHECKPOINT):
+    try:
+        _ckpt_meta_top = torch.load(RESUME_CHECKPOINT, map_location='cpu')
+        _cfg_top = _ckpt_meta_top.get('config') if isinstance(_ckpt_meta_top, dict) else None
+    except Exception:
+        _cfg_top = None
+
+    if _cfg_top is not None:
+        _APPLIED_CFG = _cfg_top
+        _mp = _cfg_top.get('MODEL_PARAMS', {})
+        DIM = _mp.get('DIM', DIM)
+        DIM_HEAD = _mp.get('DIM_HEAD', DIM_HEAD)
+        HEADS = _mp.get('HEADS', HEADS)
+        FF_MULT = _mp.get('FF_MULT', FF_MULT)
+        DEPTH = _mp.get('DEPTH', DEPTH)
+        CAUSAL = _mp.get('CAUSAL', CAUSAL)
+        USE_XPOS = _mp.get('USE_XPOS', USE_XPOS)
+        USE_DYNAMIC_POS_BIAS = _mp.get('USE_DYNAMIC_POS_BIAS', USE_DYNAMIC_POS_BIAS)
+        ATTN_WINDOW_SIZES = _mp.get('ATTN_WINDOW_SIZES', ATTN_WINDOW_SIZES)
+        CONV_EXPANSION_FACTOR = _mp.get('CONV_EXPANSION_FACTOR', CONV_EXPANSION_FACTOR)
+        CONV_KERNEL_SIZE = _mp.get('CONV_KERNEL_SIZE', CONV_KERNEL_SIZE)
+        CONV_DROPOUT = _mp.get('CONV_DROPOUT', CONV_DROPOUT)
+        FF_DROPOUT = _mp.get('FF_DROPOUT', FF_DROPOUT)
+        ATTN_DROPOUT = _mp.get('ATTN_DROPOUT', ATTN_DROPOUT)
+        MAX_SEQ_LEN = _cfg_top.get('MAX_SEQ_LEN', MAX_SEQ_LEN)
+        BATCH_SIZE = _cfg_top.get('BATCH_SIZE', BATCH_SIZE)
+        LEARNING_RATE = _cfg_top.get('LEARNING_RATE', LEARNING_RATE)
 
 writer = SummaryWriter(log_dir=LOG_DIR)
 save_config(writer)
+
+# log which config was applied from checkpoint (if any)
+if _APPLIED_CFG is not None:
+    writer.add_text('applied_config', json.dumps(_APPLIED_CFG, indent=2))
 
 # create log dir
 
@@ -250,9 +286,9 @@ model = LocalTransformer(
     ff_mult = FF_MULT,
     depth = DEPTH,
     causal = CAUSAL,
-    # local_attn_window_size = ATTN_WINDOW_SIZE,
     attn_window_sizes = ATTN_WINDOW_SIZES,
     max_seq_len = MAX_SEQ_LEN,
+    use_xpos = USE_XPOS,
     use_dynamic_pos_bias = USE_DYNAMIC_POS_BIAS,
     ignore_index = tokenizer["PAD_None"],
     attn_dropout = ATTN_DROPOUT,
@@ -267,7 +303,13 @@ print(model)
 
 # optimizer and loss
 
-optim = Adam(model.parameters(), lr=LEARNING_RATE) # TODO: try AdamW
+optim = Adam(model.parameters(), lr=LEARNING_RATE)
+scheduler = None
+if LR_SCHEDULER is not None:
+    if LR_SCHEDULER == "CosineAnnealingLR":
+        scheduler = CosineAnnealingLR(optim, T_max=NUM_BATCHES, eta_min=1e-6)
+    else:
+        raise ValueError(f"Invalid LR_SCHEDULER: {LR_SCHEDULER}")
 
 pad_id = tokenizer["PAD_None"]
 nll_sum = lambda logits, labels: F.cross_entropy(
@@ -285,12 +327,30 @@ nll_mean = lambda logits, labels: F.cross_entropy(
 
 # training
 
-constant_seed = random.choice(val_dataset)['input_ids'].to(DEVICE)
-constant_seed_midi = decode_tokens(constant_seed.tolist(), tokenizer)
+if RESUME_CHECKPOINT is not None and os.path.exists(RESUME_CHECKPOINT):
+    print(f"\nresuming from checkpoint: {RESUME_CHECKPOINT}\n")
+    ckpt = torch.load(RESUME_CHECKPOINT, map_location=DEVICE)
+    model.load_state_dict(ckpt['model_state_dict'])
+    try:
+        optim.load_state_dict(ckpt['optimizer_state_dict'])
+    except Exception:
+        print("warning: optimizer state from checkpoint could not be loaded; continuing with fresh optimizer")
+    # restore scheduler state if you add it to checkpoint later
+    start_step = int(ckpt.get('epoch', 0)) + 1
+    # log loaded config if present
+    if 'config' in ckpt:
+        writer.add_text('loaded_config', json.dumps(ckpt['config'], indent=2))
+else:
+    start_step = 0
+
+constant_seed = random.choice(val_dataset)
+const_seed_inp = constant_seed['input_ids'][-128:].to(DEVICE)
+# const_seed_mask = constant_seed['attention_mask'][-128:].bool().to(DEVICE)
+constant_seed_midi = decode_tokens(const_seed_inp.tolist(), tokenizer)
 constant_seed_midi.dump_midi(GEN_DIR / f"0_const_seed.mid")
 
 best_val_loss = float('inf')
-for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
+for i in tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training'):
     model.train()
     
     total_loss, total_tokens = 0.0, 0
@@ -322,12 +382,15 @@ for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
     writer.add_scalar('Loss/Train', train_avg_nll, i)
     writer.add_scalar('Perplexity/Train', train_ppl, i)
     
-    # writer.add_scalar('Melody_Consistency/Train', train_melody_consistency, i)
-    # print(f'training melody consistency: {train_melody_consistency:.4f}')
-    
     # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optim.step()
     optim.zero_grad()
+
+    if scheduler is not None:
+        current_lr = scheduler.get_last_lr()[0]
+        writer.add_scalar('Learning_Rate', current_lr, i)
+
+        scheduler.step()
 
     if i % VALIDATE_EVERY == 0:
         model.eval()
@@ -340,15 +403,11 @@ for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
             val_loss = nll_mean(logits, labels)
             val_ppl = torch.exp(val_loss)
             
-            # val_melody_consistency = calculate_batch_melody_consistency(inp, model, tokenizer)
-            # print(f'validation melody consistency: {val_melody_consistency:.4f}')
-            
             # Log validation metrics
             writer.add_scalar('Loss/Validation', val_loss, i)
             writer.add_scalar('Perplexity/Validation', val_ppl, i)
-            # writer.add_scalar('Melody_Consistency/Validation', val_melody_consistency, i)
             
-            # Save model checkpoint
+            # Save model checkpoint (+ config)
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optim.state_dict(),
@@ -356,7 +415,7 @@ for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
                 'train_loss': train_avg_nll,
                 'val_loss': val_loss,
                 'perplexity': val_ppl,
-                # 'val_melody_consistency': val_melody_consistency
+                'config': build_config_dict(),
             }
 
             if val_loss < best_val_loss:
@@ -393,9 +452,8 @@ for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
             # Log validation metrics
             writer.add_scalar('Loss/Validation', val_avg_nll, i)
             writer.add_scalar('Perplexity/Validation', val_ppl, i)
-            # writer.add_scalar('Melody_Consistency/Validation', val_melody_consistency, i)
             
-            # Save model checkpoint
+            # Save model checkpoint (+ config)
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optim.state_dict(),
@@ -403,7 +461,7 @@ for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
                 'train_loss': train_avg_nll,
                 'val_loss': val_avg_nll,
                 'perplexity': val_ppl,
-                # 'val_melody_consistency': val_melody_consistency
+                'config': build_config_dict(),
             }
 
             if val_avg_nll < best_val_loss:
@@ -411,37 +469,54 @@ for i in tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
                 torch.save(checkpoint, LOG_DIR / f'best_model.pt')
 
 
-    if i % GENERATE_EVERY == 0:
+    if i % GENERATE_EVERY == 0 and i != 0:
         model.eval()
         with torch.no_grad():
-            # generate with constant seed
+            for temp in [TEMPERATURE, 1.]:
 
-            gen_const = model.generate(constant_seed[None, ...], GENERATE_LENGTH, temperature=TEMPERATURE)
-            gen_const_midi = decode_tokens(gen_const[0].tolist(), tokenizer)
-            gen_const_midi.dump_midi(GEN_DIR / f"{i}_const_generated.mid")
+                # generate with constant seed
 
-            combined_const = torch.cat((constant_seed, gen_const[0]))
-            combined_const_midi = decode_tokens(combined_const.tolist(), tokenizer)
-            combined_const_midi.dump_midi(GEN_DIR / f"{i}_const_combined.mid")
+                gen_const = model.generate(
+                    const_seed_inp[None, ...],
+                    # const_seed_mask[None, ...],
+                    None,
+                    GENERATE_LENGTH,
+                    temperature=temp,
+                    filter_thres=FILTER_THRES,
+                    use_kv_cache=False,
+                )
+                gen_const_midi = decode_tokens(gen_const[0].tolist(), tokenizer)
+                gen_const_midi.dump_midi(GEN_DIR / f"{i}_{temp}_const_generated.mid")
 
-            # melody_consistency_const = calculate_melody_consistency_score(
-            #     constant_seed.tolist(), gen_const[0].tolist(), tokenizer
-            # )
+                combined_const = torch.cat((const_seed_inp, gen_const[0]))
+                combined_const_midi = decode_tokens(combined_const.tolist(), tokenizer)
+                combined_const_midi.dump_midi(GEN_DIR / f"{i}_{temp}_const_combined.mid")
 
-            # generate with random seed
+                # generate with random seed
 
-            seed = random.choice(val_dataset)['input_ids'].to(DEVICE)
-            generated = model.generate(seed[None, ...], GENERATE_LENGTH, temperature=TEMPERATURE)
-            combined = torch.cat((seed, generated[0]))
+                seed = random.choice(val_dataset)
+                seed_inp = seed['input_ids'][-128:].to(DEVICE)
+                # seed_mask = seed['attention_mask'][-128:].bool().to(DEVICE)
+                
+                generated = model.generate(
+                    seed_inp[None, ...],
+                    # seed_mask[None, ...],
+                    None,
+                    GENERATE_LENGTH,
+                    temperature=temp,
+                    filter_thres=FILTER_THRES,
+                    use_kv_cache=False,
+                )
+                combined = torch.cat((seed, generated[0]))
 
-            seed_midi = decode_tokens(seed.tolist(), tokenizer)
-            generated_midi = decode_tokens(generated[0].tolist(), tokenizer)
-            combined_midi = decode_tokens(combined.tolist(), tokenizer)
+                seed_midi = decode_tokens(seed_inp.tolist(), tokenizer)
+                generated_midi = decode_tokens(generated[0].tolist(), tokenizer)
+                combined_midi = decode_tokens(combined.tolist(), tokenizer)
 
-            seed_midi.dump_midi(GEN_DIR / f"{i}_seed.mid")
-            generated_midi.dump_midi(GEN_DIR / f"{i}_generated.mid")
-            combined_midi.dump_midi(GEN_DIR / f"{i}_combined.mid")
+                seed_midi.dump_midi(GEN_DIR / f"{i}_{temp}_seed.mid")
+                generated_midi.dump_midi(GEN_DIR / f"{i}_{temp}_generated.mid")
+                combined_midi.dump_midi(GEN_DIR / f"{i}_{temp}_combined.mid")
 
-            print("\ngeneration complete\n")
+                print(f"\ngeneration complete w/ temperature: {TEMPERATURE}\n")
 
 writer.close()
