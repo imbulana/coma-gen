@@ -15,6 +15,11 @@ def build_config_dict():
         "TOP_K_COMPOSERS": TOP_K_COMPOSERS,
         "TO_SKIP": TO_SKIP,
         "AUGMENT_DATA": AUGMENT_DATA,
+        "GRADIENT_ACCUMULATE_EVERY": GRADIENT_ACCUMULATE_EVERY,
+        "VALIDATE_EVERY": VALIDATE_EVERY,
+        "VALIDATE_ALL_EVERY": VALIDATE_ALL_EVERY,
+        "GENERATE_EVERY": GENERATE_EVERY,
+        "GENERATE_LENGTH": GENERATE_LENGTH,
 
         "TRAIN_TOKENIZER": TRAIN_TOKENIZER,
         "VOCAB_SIZE": VOCAB_SIZE,
@@ -22,8 +27,10 @@ def build_config_dict():
         "BEAT_RES": str(BEAT_RES),
         "TOKENIZER_PARAMS": {k: str(v) for k, v in TOKENIZER_PARAMS.items()},
 
+        "NUM_BATCHES": NUM_BATCHES,
         "BATCH_SIZE": BATCH_SIZE,
         "LEARNING_RATE": LEARNING_RATE,
+        "LR_SCHEDULER": LR_SCHEDULER,
         "MAX_SEQ_LEN": MAX_SEQ_LEN,
         "MAX_GRAD_NORM": MAX_GRAD_NORM,
 
@@ -46,7 +53,7 @@ def build_config_dict():
         },
 
         "GENERATE_PARAMS": {
-            "TEMPERATURE": TEMPERATURE,
+            "TEMPERATURES": TEMPERATURES,
             "FILTER_THRES": FILTER_THRES,
         },
     }

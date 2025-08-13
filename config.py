@@ -17,14 +17,20 @@ MAESTRO_CSV = MAESTRO_DATA_PATH / "maestro-v3.0.0.csv"
 
 # data splitting
 
-SPLIT_DATA = False
+SPLIT_DATA = True
 MAX_SEQ_LEN = 1024
 SHUFFLE = True
 SORT_BY = 'compositions' # must be in ['compositions', 'duration']
 TEST_SIZE = 0.1
-TOP_K_COMPOSERS = 5 # select top K composers by SORT_BY type to train/test on
-TO_SKIP = [] # composers to skip
+TOP_K_COMPOSERS = 4 # select top K composers by SORT_BY type to train/test on
+# TO_SKIP = [] # composers to skip
+TO_SKIP = ['Franz Schubert'] # composers to skip
 AUGMENT_DATA = False
+
+# NOTE: for testing only
+# split individual recordings instead of compositions 
+# note that there are multiple recordings of the same composition in the MAESTRO dataset
+_SHUFFLE_RECORDINGS = False
 
 # tokenizer
 
@@ -42,7 +48,7 @@ TOKENIZER_PARAMS = {
     "num_velocities": 24,
     "special_tokens": ["PAD", "BOS", "EOS"],
     "use_chords": True,
-    "use_rests": False,
+    "use_rests": True,
     "use_tempos": True,
     "use_time_signatures": True,
     "use_programs": False,  # no multitrack
@@ -60,7 +66,7 @@ DEPTH = 4
 CAUSAL = True
 USE_XPOS = True
 USE_DYNAMIC_POS_BIAS = False
-ATTN_WINDOW_SIZES = [32, 64]
+ATTN_WINDOW_SIZES = [128, 512]
 
 CONV_EXPANSION_FACTOR = 2
 CONV_KERNEL_SIZE = 31
@@ -68,6 +74,9 @@ CONV_KERNEL_SIZE = 31
 ATTN_DROPOUT = 0.1
 FF_DROPOUT = 0.1
 CONV_DROPOUT = 0.1
+
+USE_GLOBAL_ATTENTION = True
+GLOBAL_ATTN_LAYERS = (2, 4) # insert global attention at these layers
 
 # training
 
@@ -79,10 +88,10 @@ VALIDATE_EVERY = 150 # 1 epoch = NUM_BATCHES / (BATCH_SIZE * GRADIENT_ACCUMULATE
 VALIDATE_ALL_EVERY = int(1e5)
 
 GENERATE_EVERY  = 50
-GENERATE_LENGTH = 512
+GENERATE_LENGTH = 128
 
 LEARNING_RATE = 2e-4
-LR_SCHEDULER = None # must be in ["CosineAnnealingLR", "MultiStepLR", None]
+LR_SCHEDULER = "CosineAnnealingLR" # must be in ["CosineAnnealingLR", "MultiStepLR", None]
 # MILESTONES = [7, 14] # for MultiStepLR
 # WEIGHT_DECAY = 2e-4 # 4e-4
 
@@ -96,10 +105,10 @@ GEN_DIR = LOG_DIR / "gen"
 
 # generator params
 
-TEMPERATURE = .9
+TEMPERATURES = [.9, 1.]
 FILTER_THRES = .9
 
 # checkpointing / resume
-# Set to a checkpoint path to resume training, e.g.
-# RESUME_CHECKPOINT = Path("logs/k=5_20250101_120000/best_model.pt").resolve()
+
+# resume training from a checkpoint (requires config as well)
 RESUME_CHECKPOINT = None

@@ -226,7 +226,14 @@ class MultiscaleLocalMHA(nn.Module):
             if len(attn_window_sizes) > 1 else None
         )
 
-    def forward(self, x, mask=None, attn_bias=None, cache=None, return_cache=False):
+    def forward(
+        self, 
+        x, 
+        mask=None, 
+        attn_bias=None, 
+        cache=None, 
+        return_cache=False
+    ):
         outs = []
         new_caches = []
         
@@ -268,10 +275,9 @@ class MultiscaleLocalMHA(nn.Module):
         else:
             final_out = outs[0]
         
-        if return_cache:
-            return final_out, new_caches
-        else:
+        if not return_cache:
             return final_out
+        return final_out, new_caches
 
 # dynamic positional bias
 
@@ -560,7 +566,6 @@ class LocalTransformer(Module):
     def generate(
         self,
         prime,
-        prime_mask,
         seq_len,
         temperature = 1.,
         filter_thres = 0.9,
@@ -573,19 +578,13 @@ class LocalTransformer(Module):
         n, device = prime.shape[1], prime.device
 
         out = prime
-        # track a running attention mask aligned with `out`
-        out_mask = prime_mask if exists(prime_mask) else torch.ones_like(prime, dtype=torch.bool, device=device)
 
         cache = None
 
         for _ in range(seq_len):
-            # slice to model's max context
-            x_in = out[:, -self.max_seq_len:]
-            m_in = out_mask[:, -self.max_seq_len:] if exists(out_mask) else None
 
             logits, new_cache = self.forward(
-                x_in,
-                mask = m_in,
+                out[:, -self.max_seq_len:],
                 cache = cache,
                 return_cache = True,
                 **kwargs
@@ -603,10 +602,6 @@ class LocalTransformer(Module):
                 sampled = torch.multinomial(probs, 1)
 
             out = torch.cat((out, sampled), dim = -1)
-            # newly sampled token is valid, extend mask accordingly
-            if exists(out_mask):
-                new_valid = torch.ones((out_mask.shape[0], 1), dtype=torch.bool, device=device)
-                out_mask = torch.cat((out_mask, new_valid), dim = -1)
 
         return out[:, n:]
 

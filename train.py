@@ -55,6 +55,7 @@ if RESUME_CHECKPOINT is not None and os.path.exists(RESUME_CHECKPOINT):
         ATTN_DROPOUT = _mp.get('ATTN_DROPOUT', ATTN_DROPOUT)
         MAX_SEQ_LEN = _cfg_top.get('MAX_SEQ_LEN', MAX_SEQ_LEN)
         BATCH_SIZE = _cfg_top.get('BATCH_SIZE', BATCH_SIZE)
+        NUM_BATCHES = _cfg_top.get('NUM_BATCHES', NUM_BATCHES)
         LEARNING_RATE = _cfg_top.get('LEARNING_RATE', LEARNING_RATE)
 
 writer = SummaryWriter(log_dir=LOG_DIR)
@@ -234,10 +235,7 @@ if AUGMENT_DATA:
     midi_paths_train = list(MAESTRO_DATA_PATH.glob(leaf("train")))
     print(f"\ntrain samples (augmentations added): {len(midi_paths_train)}")
 
-# NOTE: for testing only
-# split individual recordings instead of compositions 
-# note that there are multiple recordings of the same composition in the MAESTRO dataset
-_SHUFFLE_RECORDINGS = True
+_SHUFFLE_RECORDINGS = False
 if _SHUFFLE_RECORDINGS:
     print("\nshuffling recordings...\n")
     all_paths = midi_paths_train + midi_paths_valid + midi_paths_test
@@ -255,17 +253,11 @@ if _SHUFFLE_RECORDINGS:
 
 # define datasets and dataloaders
 
-# get_composer_label = (
-#     lambda dummy1, dummy2, x: x.parent.name # signature expected by DatasetMIDI
-#     if LABEL_COMPOSER else None
-# )
-
 kwargs_dataset = {
     "max_seq_len": MAX_SEQ_LEN, 
     "tokenizer": tokenizer,
     "bos_token_id": tokenizer["BOS_None"],
     "eos_token_id": tokenizer["EOS_None"],
-    # "func_to_get_labels": get_composer_label
 }
 
 train_dataset = DatasetMIDI(midi_paths_train, **kwargs_dataset)
@@ -277,6 +269,24 @@ train_loader = cycle(DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=Tr
 val_loader = cycle(DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator_left_pad))
 
 # instantiate model
+
+# global attention layer
+global_attn = None
+if USE_GLOBAL_ATTENTION:
+    from src.transformer import LocalMHA
+    global_attn = LocalMHA(
+        dim=DIM,
+        window_size=MAX_SEQ_LEN,  # global attention
+        dim_head=DIM_HEAD,
+        heads=HEADS,
+        dropout=ATTN_DROPOUT,
+        causal=CAUSAL,
+        prenorm=True,
+        qk_rmsnorm=True,
+        qk_scale=8,
+        use_xpos=USE_XPOS,
+        exact_windowsize=False
+    )
 
 model = LocalTransformer(
     num_tokens = len(tokenizer), # vocab size
@@ -296,6 +306,8 @@ model = LocalTransformer(
     conv_dropout = CONV_DROPOUT,
     conv_expansion_factor = CONV_EXPANSION_FACTOR,
     conv_kernel_size = CONV_KERNEL_SIZE,
+    global_attn_layer = global_attn,
+    layers_insert_global_attn = GLOBAL_ATTN_LAYERS if USE_GLOBAL_ATTENTION else None,
 ).to(DEVICE)
 
 print(f"\nmodel size: {sum(p.numel() for p in model.parameters()):,}")
@@ -345,7 +357,6 @@ else:
 
 constant_seed = random.choice(val_dataset)
 const_seed_inp = constant_seed['input_ids'][-128:].to(DEVICE)
-# const_seed_mask = constant_seed['attention_mask'][-128:].bool().to(DEVICE)
 constant_seed_midi = decode_tokens(const_seed_inp.tolist(), tokenizer)
 constant_seed_midi.dump_midi(GEN_DIR / f"0_const_seed.mid")
 
@@ -354,7 +365,6 @@ for i in tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training'):
     model.train()
     
     total_loss, total_tokens = 0.0, 0
-    # train_melody_consistency_total = 0.
     for _ in range(GRADIENT_ACCUMULATE_EVERY):
         inp, mask = next(train_loader)
 
@@ -469,22 +479,21 @@ for i in tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training'):
                 torch.save(checkpoint, LOG_DIR / f'best_model.pt')
 
 
-    if i % GENERATE_EVERY == 0 and i != 0:
+    if i % GENERATE_EVERY == -1:
         model.eval()
         with torch.no_grad():
-            for temp in [TEMPERATURE, 1.]:
+            for temp in TEMPERATURES:
 
                 # generate with constant seed
 
                 gen_const = model.generate(
                     const_seed_inp[None, ...],
-                    # const_seed_mask[None, ...],
-                    None,
                     GENERATE_LENGTH,
                     temperature=temp,
                     filter_thres=FILTER_THRES,
                     use_kv_cache=False,
                 )
+
                 gen_const_midi = decode_tokens(gen_const[0].tolist(), tokenizer)
                 gen_const_midi.dump_midi(GEN_DIR / f"{i}_{temp}_const_generated.mid")
 
@@ -496,18 +505,16 @@ for i in tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training'):
 
                 seed = random.choice(val_dataset)
                 seed_inp = seed['input_ids'][-128:].to(DEVICE)
-                # seed_mask = seed['attention_mask'][-128:].bool().to(DEVICE)
                 
                 generated = model.generate(
                     seed_inp[None, ...],
-                    # seed_mask[None, ...],
-                    None,
                     GENERATE_LENGTH,
                     temperature=temp,
                     filter_thres=FILTER_THRES,
                     use_kv_cache=False,
                 )
-                combined = torch.cat((seed, generated[0]))
+
+                combined = torch.cat((seed_inp, generated[0]))
 
                 seed_midi = decode_tokens(seed_inp.tolist(), tokenizer)
                 generated_midi = decode_tokens(generated[0].tolist(), tokenizer)
@@ -517,6 +524,6 @@ for i in tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training'):
                 generated_midi.dump_midi(GEN_DIR / f"{i}_{temp}_generated.mid")
                 combined_midi.dump_midi(GEN_DIR / f"{i}_{temp}_combined.mid")
 
-                print(f"\ngeneration complete w/ temperature: {TEMPERATURE}\n")
+                print(f"\ngeneration complete w/ temperature: {temp}\n")
 
 writer.close()
