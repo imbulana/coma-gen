@@ -551,8 +551,6 @@ class LocalTransformer(Module):
                 ])
             )
 
-        self.post_norm = nn.LayerNorm(dim)
-
         self.ignore_index = ignore_index
 
         if self.has_embed_unembed:
@@ -673,7 +671,6 @@ class LocalTransformer(Module):
             x = ff2(x)
 
         x = self.reduce_streams(x)
-        x = self.post_norm(x)
 
         if not self.has_embed_unembed:
             return x
