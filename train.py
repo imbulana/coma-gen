@@ -26,44 +26,10 @@ from src import LocalTransformer
 # load config
 
 from config import *
-from utils import save_config, build_config_dict
-
-_APPLIED_CFG = None
-if RESUME_CHECKPOINT is not None and os.path.exists(RESUME_CHECKPOINT):
-    try:
-        _ckpt_meta_top = torch.load(RESUME_CHECKPOINT, map_location='cpu')
-        _cfg_top = _ckpt_meta_top.get('config') if isinstance(_ckpt_meta_top, dict) else None
-    except Exception:
-        _cfg_top = None
-
-    if _cfg_top is not None:
-        _APPLIED_CFG = _cfg_top
-        _mp = _cfg_top.get('MODEL_PARAMS', {})
-        DIM = _mp.get('DIM', DIM)
-        DIM_HEAD = _mp.get('DIM_HEAD', DIM_HEAD)
-        HEADS = _mp.get('HEADS', HEADS)
-        FF_MULT = _mp.get('FF_MULT', FF_MULT)
-        DEPTH = _mp.get('DEPTH', DEPTH)
-        CAUSAL = _mp.get('CAUSAL', CAUSAL)
-        USE_XPOS = _mp.get('USE_XPOS', USE_XPOS)
-        USE_DYNAMIC_POS_BIAS = _mp.get('USE_DYNAMIC_POS_BIAS', USE_DYNAMIC_POS_BIAS)
-        ATTN_WINDOW_SIZES = _mp.get('ATTN_WINDOW_SIZES', ATTN_WINDOW_SIZES)
-        CONV_EXPANSION_FACTOR = _mp.get('CONV_EXPANSION_FACTOR', CONV_EXPANSION_FACTOR)
-        CONV_KERNEL_SIZE = _mp.get('CONV_KERNEL_SIZE', CONV_KERNEL_SIZE)
-        CONV_DROPOUT = _mp.get('CONV_DROPOUT', CONV_DROPOUT)
-        FF_DROPOUT = _mp.get('FF_DROPOUT', FF_DROPOUT)
-        ATTN_DROPOUT = _mp.get('ATTN_DROPOUT', ATTN_DROPOUT)
-        MAX_SEQ_LEN = _cfg_top.get('MAX_SEQ_LEN', MAX_SEQ_LEN)
-        BATCH_SIZE = _cfg_top.get('BATCH_SIZE', BATCH_SIZE)
-        NUM_BATCHES = _cfg_top.get('NUM_BATCHES', NUM_BATCHES)
-        LEARNING_RATE = _cfg_top.get('LEARNING_RATE', LEARNING_RATE)
+from utils import save_config
 
 writer = SummaryWriter(log_dir=LOG_DIR)
 save_config(writer)
-
-# log which config was applied from checkpoint (if any)
-if _APPLIED_CFG is not None:
-    writer.add_text('applied_config', json.dumps(_APPLIED_CFG, indent=2))
 
 # create log dir
 
@@ -87,13 +53,6 @@ def cycle(loader):
 
 def decode_tokens(tokens, tokenizer):
     return tokenizer([tokens])
-
-def top_k(logits, thres = 0.9):
-    k = int((1 - thres) * logits.shape[-1])
-    val, ind = torch.topk(logits, k)
-    probs = torch.full_like(logits, float('-inf'))
-    probs.scatter_(1, ind, val)
-    return probs
 
 def extract_pitches_from_tokens(tokens, tokenizer):
     pass
@@ -270,7 +229,6 @@ val_loader = cycle(DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
 
 # instantiate model
 
-# global attention layer
 global_attn = None
 if USE_GLOBAL_ATTENTION:
     from src.transformer import LocalMHA
@@ -339,29 +297,45 @@ nll_mean = lambda logits, labels: F.cross_entropy(
 
 # training
 
+start_step = 0
 if RESUME_CHECKPOINT is not None and os.path.exists(RESUME_CHECKPOINT):
     print(f"\nresuming from checkpoint: {RESUME_CHECKPOINT}\n")
+
     ckpt = torch.load(RESUME_CHECKPOINT, map_location=DEVICE)
     model.load_state_dict(ckpt['model_state_dict'])
+
+    # load optimizer and lr scheduler state
+
     try:
         optim.load_state_dict(ckpt['optimizer_state_dict'])
     except Exception:
-        print("warning: optimizer state from checkpoint could not be loaded; continuing with fresh optimizer")
-    # restore scheduler state if you add it to checkpoint later
-    start_step = int(ckpt.get('epoch', 0)) + 1
-    # log loaded config if present
-    if 'config' in ckpt:
-        writer.add_text('loaded_config', json.dumps(ckpt['config'], indent=2))
-else:
-    start_step = 0
+        print("optimizer state from checkpoint could not be loaded; continuing with fresh optimizer")
+    
+
+    if scheduler is not None and 'scheduler_state_dict' in ckpt:
+        try:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            print("scheduler state loaded from checkpoint")
+        except Exception:
+            print("scheduler state from checkpoint could not be loaded; continuing with fresh scheduler")
+
+    start_step = int(ckpt.get('step', 0)) + 1
+
+    # NOTE: for backward compatibility
+    if start_step == 1:
+        start_step = int(ckpt.get('epoch', 0)) + 1
+
+# constant seed for generation
 
 constant_seed = random.choice(val_dataset)
 const_seed_inp = constant_seed['input_ids'][-128:].to(DEVICE)
 constant_seed_midi = decode_tokens(const_seed_inp.tolist(), tokenizer)
 constant_seed_midi.dump_midi(GEN_DIR / f"0_const_seed.mid")
 
+# training loop
+
 best_val_loss = float('inf')
-for i in tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training'):
+for i in tqdm(range(start_step, NUM_BATCHES), desc='training'):
     model.train()
     
     total_loss, total_tokens = 0.0, 0
@@ -391,8 +365,10 @@ for i in tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training'):
     # log to tensorboard
     writer.add_scalar('Loss/Train', train_avg_nll, i)
     writer.add_scalar('Perplexity/Train', train_ppl, i)
-    
-    # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+
+    if MAX_GRAD_NORM is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+
     optim.step()
     optim.zero_grad()
 
@@ -413,29 +389,34 @@ for i in tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training'):
             val_loss = nll_mean(logits, labels)
             val_ppl = torch.exp(val_loss)
             
-            # Log validation metrics
+            # log validation metrics
+
             writer.add_scalar('Loss/Validation', val_loss, i)
             writer.add_scalar('Perplexity/Validation', val_ppl, i)
             
-            # Save model checkpoint (+ config)
+            # save model checkpoint
+            
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optim.state_dict(),
-                'epoch': i,
+                'step': i,
                 'train_loss': train_avg_nll,
                 'val_loss': val_loss,
                 'perplexity': val_ppl,
-                'config': build_config_dict(),
             }
+            
+            # Add scheduler state if scheduler exists
+            if scheduler is not None:
+                checkpoint['scheduler_state_dict'] = scheduler.state_dict()
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save(checkpoint, LOG_DIR / f'best_model.pt')
 
-    if i % VALIDATE_ALL_EVERY == 0 and i != 0:
+    if i % VALIDATE_ALL_EVERY == 0 and i!=0:
+        print(f"\nvalidating on entire validation set...\n")
         model.eval()
         with torch.no_grad():
-            # evaluate over the entire validation set
             val_epoch_loader = DataLoader(
                 val_dataset,
                 batch_size=BATCH_SIZE,
@@ -444,7 +425,7 @@ for i in tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training'):
             )
 
             val_total_loss, val_total_tokens = 0.0, 0
-            for batch in val_epoch_loader:
+            for batch in tqdm(val_epoch_loader, desc=f"Validation Epoch {i}", leave=False):
                 inp = batch['input_ids'].to(DEVICE)
                 mask = batch['attention_mask'].bool().to(DEVICE)
 
@@ -459,27 +440,33 @@ for i in tqdm(range(start_step, NUM_BATCHES), mininterval=10., desc='training'):
             val_avg_nll = val_total_loss / val_total_tokens
             val_ppl = torch.exp(val_avg_nll)
 
-            # Log validation metrics
+            # log validation metrics
+
             writer.add_scalar('Loss/Validation', val_avg_nll, i)
             writer.add_scalar('Perplexity/Validation', val_ppl, i)
             
-            # Save model checkpoint (+ config)
+            # save model checkpointh
+
             checkpoint = {
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optim.state_dict(),
-                'epoch': i,
+                'step': i,
                 'train_loss': train_avg_nll,
                 'val_loss': val_avg_nll,
                 'perplexity': val_ppl,
-                'config': build_config_dict(),
             }
+            
+            # add scheduler state
+
+            if scheduler is not None:
+                checkpoint['scheduler_state_dict'] = scheduler.state_dict()
 
             if val_avg_nll < best_val_loss:
                 best_val_loss = val_avg_nll
                 torch.save(checkpoint, LOG_DIR / f'best_model.pt')
 
 
-    if i % GENERATE_EVERY == -1:
+    if i % GENERATE_EVERY == -1: # NOTE: disabled for now
         model.eval()
         with torch.no_grad():
             for temp in TEMPERATURES:

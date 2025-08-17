@@ -17,14 +17,14 @@ MAESTRO_CSV = MAESTRO_DATA_PATH / "maestro-v3.0.0.csv"
 
 # data splitting
 
-SPLIT_DATA = True
+SPLIT_DATA = False
 MAX_SEQ_LEN = 1024
-SHUFFLE = True
+SHUFFLE = False
 SORT_BY = 'compositions' # must be in ['compositions', 'duration']
 TEST_SIZE = 0.1
-TOP_K_COMPOSERS = 4 # select top K composers by SORT_BY type to train/test on
-# TO_SKIP = [] # composers to skip
-TO_SKIP = ['Franz Schubert'] # composers to skip
+TOP_K_COMPOSERS = 100 # select top K composers by SORT_BY type to train/test on
+TO_SKIP = [] # composers to skip
+# TO_SKIP = ['Franz Schubert'] # composers to skip
 AUGMENT_DATA = False
 
 # NOTE: for testing only
@@ -66,7 +66,9 @@ DEPTH = 4
 CAUSAL = True
 USE_XPOS = True
 USE_DYNAMIC_POS_BIAS = False
-ATTN_WINDOW_SIZES = [128, 512]
+ATTN_WINDOW_SIZES = [64, 256, 512]
+USE_GLOBAL_ATTENTION = False
+GLOBAL_ATTN_LAYERS = (2, 4) # insert global attention at these layers
 
 CONV_EXPANSION_FACTOR = 2
 CONV_KERNEL_SIZE = 31
@@ -74,9 +76,6 @@ CONV_KERNEL_SIZE = 31
 ATTN_DROPOUT = 0.1
 FF_DROPOUT = 0.1
 CONV_DROPOUT = 0.1
-
-USE_GLOBAL_ATTENTION = True
-GLOBAL_ATTN_LAYERS = (2, 4) # insert global attention at these layers
 
 # training
 
@@ -108,7 +107,11 @@ GEN_DIR = LOG_DIR / "gen"
 TEMPERATURES = [.9, 1.]
 FILTER_THRES = .9
 
-# checkpointing / resume
+# resume training from a checkpoint
 
-# resume training from a checkpoint (requires config as well)
-RESUME_CHECKPOINT = None
+RESUME_LOG_DIR = Path('logs/k=100_20250816_011154').resolve()
+RESUME_CHECKPOINT = RESUME_LOG_DIR / 'best_model.pt'
+
+if RESUME_LOG_DIR is not None:
+    LOG_DIR = RESUME_LOG_DIR
+    GEN_DIR = RESUME_LOG_DIR / 'gen'
