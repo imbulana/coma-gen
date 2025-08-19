@@ -6,7 +6,7 @@ Model Architecture (see [`src/transformer.py`](src/transformer.py)):
 
 - **Decoder**: Stack of conformer-like blocks[^1] (1/2 * FeedForward → Multi-Scale Local Attention → Conformer Conv Module → 1/2 * FeedForward) blocks with hyper-connections and residual streams:
     - **Local Attention**: Multi-scale local self-attention with multiple window sizes (e.g., [32, 64]).
-        - Each scale uses windowed attention (not full sequence) with optional rotary position embeddings (xpos) or dynamic position bias
+        - Each scale uses windowed attention with optional rotary position embeddings (xpos) or dynamic position bias
         - Scales aggregated via learnable weighted sum
         - Query-Key RMSNorm with learnable scales for improved training stability
     - **Conformer Conv Module**: 
@@ -34,7 +34,7 @@ pip install -r requirements.txt
 
 ## Dataset
 
-Download the Maestro 3.0 dataset
+Download the Maestro 3.0 dataset[^3]
 
 ```bash
 wget https://storage.googleapis.com/magentadata/datasets/maestro/v3.0.0/maestro-v3.0.0-midi.zip
@@ -45,13 +45,7 @@ mv 'maestro-v3.0.0' 'data/maestro-v3.0.0'
 
 ## Usage
 
-Train the tokenizer with
-
-```bash
-python3 train_tokenizer.py
-```
-
-Adjust training params in [`train.py`](/train.py) and begin training the transformer with
+Adjust training params in [`config.py`](/config.py) and begin training the transformer with
 
 ```bash
 python3 train.py
