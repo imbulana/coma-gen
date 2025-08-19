@@ -1,3 +1,5 @@
+<img src="assets/banner.png" width="600px"></img>
+
 Conformer with multi-scale local attention for symbolic music generation.
 
 Model Architecture (see [`src/transformer.py`](src/transformer.py)):
