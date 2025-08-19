@@ -4,10 +4,9 @@ __pycache__/
 
 *.pt
 data/
-generated/
+gen*/
+checkpoints/
 logs/
 *.json
 
 TODO.md
-
-tests/
