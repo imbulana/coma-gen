@@ -393,6 +393,7 @@ for i in tqdm(range(start_step, NUM_BATCHES), desc='training'):
 
             writer.add_scalar('Loss/Validation', val_loss, i)
             writer.add_scalar('Perplexity/Validation', val_ppl, i)
+            print(f"validation loss: {val_loss:.4f}, perplexity: {val_ppl:.4f}")
             
             # save model checkpoint
             
@@ -405,11 +406,16 @@ for i in tqdm(range(start_step, NUM_BATCHES), desc='training'):
                 'perplexity': val_ppl,
             }
             
-            # Add scheduler state if scheduler exists
+            # add scheduler state if scheduler exists
+
             if scheduler is not None:
                 checkpoint['scheduler_state_dict'] = scheduler.state_dict()
 
+            # save model checkpoint
+
+            torch.save(checkpoint, LOG_DIR / f"latest_model.pt")
             if val_loss < best_val_loss:
+                print(f"\nsaving best model checkpoint (step {i})...\n")
                 best_val_loss = val_loss
                 torch.save(checkpoint, LOG_DIR / f'best_model.pt')
 

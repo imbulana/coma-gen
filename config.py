@@ -110,7 +110,7 @@ FILTER_THRES = .9
 # resume training from a checkpoint
 
 RESUME_LOG_DIR = Path('logs/k=100_20250816_011154').resolve()
-RESUME_CHECKPOINT = RESUME_LOG_DIR / 'best_model.pt'
+RESUME_CHECKPOINT = RESUME_LOG_DIR / 'latest_model.pt'
 
 if RESUME_LOG_DIR is not None:
     LOG_DIR = RESUME_LOG_DIR
