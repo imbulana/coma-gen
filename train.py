@@ -417,9 +417,11 @@ for i in tqdm(range(start_step, NUM_BATCHES), desc='training'):
             if val_loss < best_val_loss:
                 print(f"\nsaving best model checkpoint (step {i})...\n")
                 best_val_loss = val_loss
-                torch.save(checkpoint, LOG_DIR / f'best_model.pt')
 
-    if (i % VALIDATE_ALL_EVERY == 0 and i!=0) or i == start_step:
+                postfix = f"ft_{DATETIME_STR}" if start_step != 0 else ""
+                torch.save(checkpoint, LOG_DIR / f'best_model_{postfix}.pt')
+
+    if (i % VALIDATE_ALL_EVERY == 0 and i!=0) or start_step != 0:
         print(f"\nvalidating on entire validation set...\n")
         model.eval()
         with torch.no_grad():
@@ -470,9 +472,11 @@ for i in tqdm(range(start_step, NUM_BATCHES), desc='training'):
                 checkpoint['scheduler_state_dict'] = scheduler.state_dict()
 
             if val_avg_nll < best_val_loss:
-                best_val_loss = val_avg_nll
-                torch.save(checkpoint, LOG_DIR / f'best_model.pt')
+                print(f"\nsaving best model checkpoint (step {i})...\n")
 
+                best_val_loss = val_avg_nll
+                postfix = f"ft_{DATETIME_STR}" if start_step != 0 else ""
+                torch.save(checkpoint, LOG_DIR / f'best_model_{postfix}.pt')
 
     if i % GENERATE_EVERY == -1: # NOTE: disabled for now
         model.eval()
