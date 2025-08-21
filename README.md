@@ -1,6 +1,6 @@
 <img src="assets/banner.png" width="600px"></img>
 
-Conformer with multi-scale local attention for symbolic music generation.
+Conformer with multi-scale local attention for symbolic music generation. See [coma](https://github.com/imbulana/coma) for a similar architecture used for composer classification.
 
 Model Architecture (see [`src/transformer.py`](src/transformer.py)):
 
