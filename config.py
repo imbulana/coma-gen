@@ -91,15 +91,14 @@ GENERATE_LENGTH = 128
 
 LEARNING_RATE = 2e-4
 LR_SCHEDULER = "CosineAnnealingLR" # must be in ["CosineAnnealingLR", "MultiStepLR", None]
-# MILESTONES = [7, 14] # for MultiStepLR
-# WEIGHT_DECAY = 2e-4 # 4e-4
+MILESTONES = [7, 14] # for MultiStepLR
 
 MAX_GRAD_NORM = None # for gradient clipping, set to None to disable
 
 # tensorboard logs
 
-datetime_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-LOG_DIR = Path("logs") / f"k={TOP_K_COMPOSERS}_{datetime_str}"
+DATETIME_STR = datetime.now().strftime("%Y%m%d_%H%M%S")
+LOG_DIR = Path("logs") / f"k={TOP_K_COMPOSERS}_{DATETIME_STR}"
 GEN_DIR = LOG_DIR / "gen"
 
 # generator params
@@ -109,8 +108,8 @@ FILTER_THRES = .9
 
 # resume training from a checkpoint
 
-RESUME_LOG_DIR = Path('logs/k=100_20250816_011154').resolve()
-RESUME_CHECKPOINT = RESUME_LOG_DIR / 'latest_model.pt'
+RESUME_LOG_DIR = None
+RESUME_CHECKPOINT = None
 
 if RESUME_LOG_DIR is not None:
     LOG_DIR = RESUME_LOG_DIR
