@@ -312,12 +312,12 @@ if RESUME_CHECKPOINT is not None and os.path.exists(RESUME_CHECKPOINT):
         print("optimizer state from checkpoint could not be loaded; continuing with fresh optimizer")
     
 
-    if scheduler is not None and 'scheduler_state_dict' in ckpt:
-        try:
-            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-            print("scheduler state loaded from checkpoint")
-        except Exception:
-            print("scheduler state from checkpoint could not be loaded; continuing with fresh scheduler")
+    # if scheduler is not None and 'scheduler_state_dict' in ckpt:
+    #     try:
+    #         scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+    #         print("scheduler state loaded from checkpoint")
+    #     except Exception:
+    #         print("scheduler state from checkpoint could not be loaded; continuing with fresh scheduler")
 
     start_step = int(ckpt.get('step', 0)) + 1
 
@@ -419,7 +419,7 @@ for i in tqdm(range(start_step, NUM_BATCHES), desc='training'):
                 best_val_loss = val_loss
                 torch.save(checkpoint, LOG_DIR / f'best_model.pt')
 
-    if i % VALIDATE_ALL_EVERY == 0 and i!=0:
+    if (i % VALIDATE_ALL_EVERY == 0 and i!=0) or i == start_step:
         print(f"\nvalidating on entire validation set...\n")
         model.eval()
         with torch.no_grad():
@@ -445,6 +445,8 @@ for i in tqdm(range(start_step, NUM_BATCHES), desc='training'):
 
             val_avg_nll = val_total_loss / val_total_tokens
             val_ppl = torch.exp(val_avg_nll)
+
+            print(f"validation loss: {val_avg_nll:.4f}, perplexity: {val_ppl:.4f}")
 
             # log validation metrics
 
