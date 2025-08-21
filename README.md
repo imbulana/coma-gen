@@ -19,6 +19,10 @@ Model Architecture (see [`src/transformer.py`](src/transformer.py)):
 
 - **Output**: LayerNorm → Linear projection to vocabulary size
 
+## Todo
+
+- [ ] KV caching
+
 ## Setup
 
 Create a conda environment with python 3.11
