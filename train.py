@@ -312,12 +312,12 @@ if RESUME_CHECKPOINT is not None and os.path.exists(RESUME_CHECKPOINT):
         print("optimizer state from checkpoint could not be loaded; continuing with fresh optimizer")
     
 
-    # if scheduler is not None and 'scheduler_state_dict' in ckpt:
-    #     try:
-    #         scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-    #         print("scheduler state loaded from checkpoint")
-    #     except Exception:
-    #         print("scheduler state from checkpoint could not be loaded; continuing with fresh scheduler")
+    if scheduler is not None and 'scheduler_state_dict' in ckpt:
+        try:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            print("scheduler state loaded from checkpoint")
+        except Exception:
+            print("scheduler state from checkpoint could not be loaded; continuing with fresh scheduler")
 
     start_step = int(ckpt.get('step', 0)) + 1
 
